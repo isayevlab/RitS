@@ -1,4 +1,4 @@
-run_name: 'ts1x_megalodon_flow_v9'
+run_name: 'ts1x_megalodon_diffusion_v3'
 outdir: null
 resume: null
 
@@ -24,60 +24,61 @@ loss:
     ts_coord: 1.0
   variables:
     - variable_name: 'ts_coord'
-      loss_scale: 1.0
+      loss_scale: 3.0
       aggregate: 'mean'
       continuous: True
-      loss_type: 'mse'
       use_distance: null
       distance_scale: null
 
 interpolant:
-  timesteps: &timesteps 25
-  time_type: &time_type "continuous"
-  sample_time_method: "uniform"
-  sample_time_mean: 0
-  sample_time_scale: 1.0
-  global_variable_name: 'ts_coord'
-  min_t: &min_t 0.0
+  timesteps: &timesteps 100
+  time_type: &time_type "discrete" #["discrete, "continuous]
+  scheduler_type: &scheduler_type "cosine_adaptive" #["cosine_adaptive, "linear"]
+  sample_time_method: "uniform" # ["symmetric", "uniform", "stab_mode", "logit_normal", "beta"]
+  sample_time_mean: 0 # Used in stab_mode and logit_normal
+  sample_time_scale: 0.81 # Used in stab_mode and logit_normal
+  global_variable_name: 'ts_coord' # variable that is specficed below to be used for sampling time and loss sampling
+  min_t: &min_t 0
   variables:
     - variable_name: 'ts_coord'
-      interpolant_type: 'continuous_flow_matching' #["continuous_diffusion", "continuous_flow_matching"]
-      prediction_type: 'velocity'
-      optimal_transport: 'rigid' #'scale_ot'
+      interpolant_type: 'continuous_diffusion' #["continuous_diffusion", "continuous_flow_matching"]
+      diffusion_type: 'vdm'
       prior_type: 'gaussian'
       timesteps: *timesteps
       num_classes: 3
-      scheduler_type: "linear"
+      scheduler_type: *scheduler_type
       scheduler_cut: False
       time_type: *time_type
-      min_t: *min_t
+      nu: 2.5
       com_free: True
-      noise_sigma: 0.0
-      inference_noise_sigma: 0.
+      min_t: *min_t
     - variable_name: 'numbers'
-      interpolant_type: "discrete_null"
+      interpolant_type: "discrete_null" #["discrete_diffusion", "discrete_flow_matching"]
       num_classes: &num_atoms 54
       prior_type: null
     - variable_name: 'bmat_r'
-      interpolant_type: "discrete_null"
-      num_classes: 9
+      interpolant_type: "discrete_null" #["discrete_diffusion", "discrete_flow_matching"]
+      num_classes: 5
       prior_type: null
     - variable_name: 'bmat_p'
-      interpolant_type: "discrete_null"
-      num_classes: 9
+      interpolant_type: "discrete_null" #["discrete_diffusion", "discrete_flow_matching"]
+      num_classes: 5
       prior_type: null
+
     - variable_name: 'charges'
-      interpolant_type: "discrete_null"
+      interpolant_type: "discrete_null" #["discrete_diffusion", "discrete_flow_matching"]
       concat: 'numbers'
       num_classes: 7
       offset: 4
       prior_type: null
 
+
+
 dynamics:
   model_name: "megav3ts"
   model_args:
     atom_classes: 61
-    edge_classes: 9
+    edge_classes: 5
     invariant_edge_feat_dim: 64
     invariant_node_feat_dim: 256
     n_vector_features: 64
@@ -90,18 +91,25 @@ dynamics:
     timesteps: *timesteps
     time_type: *time_type
 
+self_conditioning:
+  name: "base"
+  variables:
+    - variable_name: ts_coord
+      hidden_dims: 32
+      fuse_softmax: False
+      vector: True
+      clamp_min: -100
+      clamp_max: 100
+
 sample:
   node_distribution: null
-  step_lr: 1.e-6
-  clip: 1000.0
-  return_step_output: True
 
 train:
-  seed: 0
+  seed: 48
   gpus: 1
   n_epochs: 500
   enable_progress_bar: True
-  gradient_clip_value: 3000.0
+  gradient_clip_value: 1.0
   log_freq: 50
   val_freq: 50
   checkpoint_monitor: "val/loss"
@@ -115,18 +123,18 @@ evaluation:
   scale_coords: *scale_coords
   save_dir: 'ts_data'
 
+
 optimizer:
   type: adamw
-  lr: 5.e-4
-  weight_decay: 0.01
-  amsgrad: False
+  lr: 1.e-4
+  weight_decay: 1.e-12
+  amsgrad: True
 
 lr_scheduler:
-  type: plateau
-  factor: 0.8
-  patience: 10
-  min_lr: 0.000125
+  type: linear_warmup
+  initial_lr: 1.e-5
+  final_lr: 1.e-4
+  num_warmup_steps: 1000
   interval: step
-  frequency: 1
-  cooldown: 0
-  monitor: "val/loss"
+  frequency: 1 #not in config but this is the default
+

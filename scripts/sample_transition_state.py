@@ -568,7 +568,7 @@ def main():
         interpolant_params=cfg.interpolant,
         sampling_params=cfg.sample,
         batch_preprocessor=batch_preprocessor,
-        strict=False,
+        strict=True,
     )
     model = model.to("cuda").eval()
 
