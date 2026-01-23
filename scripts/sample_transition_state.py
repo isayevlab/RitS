@@ -411,10 +411,10 @@ def process_reaction_smarts(r_smarts, p_smarts, charge=0, kekulize=False, add_st
 
     # Optionally add stereo bond information
     if add_stereo:
-        chi_bonds = (5, 6)
+        chi_bonds = (7, 8)
         ez_bonds = {
-            Chem.BondStereo.STEREOE: 7,
-            Chem.BondStereo.STEREOZ: 8,
+            Chem.BondStereo.STEREOE: 5,
+            Chem.BondStereo.STEREOZ: 6,
         }
 
         r_bmat = np.zeros((N, N), dtype=np.int64)
@@ -424,8 +424,12 @@ def process_reaction_smarts(r_smarts, p_smarts, charge=0, kekulize=False, add_st
             r_bmat[i, j] = r_edge_type[idx].item()
             p_bmat[i, j] = p_edge_type[idx].item()
 
-        r_bmat = add_stereo_bonds(r, chi_bonds, ez_bonds, r_bmat, from_3D=False)
-        p_bmat = add_stereo_bonds(p, chi_bonds, ez_bonds, p_bmat, from_3D=False)
+        # Reorder molecules to match atom mapping before extracting stereo
+        r_reordered = Chem.RenumberAtoms(r, r_perm_inv.tolist())
+        p_reordered = Chem.RenumberAtoms(p, p_perm_inv.tolist())
+        
+        r_bmat = add_stereo_bonds(r_reordered, chi_bonds, ez_bonds, r_bmat, from_3D=False)
+        p_bmat = add_stereo_bonds(p_reordered, chi_bonds, ez_bonds, p_bmat, from_3D=False)
 
         existing_edges = set(zip(edge_index[0].tolist(), edge_index[1].tolist()))
         new_edges = []
