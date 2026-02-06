@@ -48,8 +48,13 @@ def main(cfg: DictConfig) -> None:
     loss_fn = None
 
     if cfg.evaluation.type == "transition_states":
-        batch_preprocessor = TsBatchPreProcessor(aug_rotations=cfg.data.aug_rotations,
-                                           scale_coords=cfg.data.scale_coords)
+        ts_ratio = OmegaConf.select(cfg, "data.ts_ratio", default=1.0)
+        logging.info(f"TS ratio (curriculum learning): {ts_ratio}")
+        batch_preprocessor = TsBatchPreProcessor(
+            aug_rotations=cfg.data.aug_rotations,
+            scale_coords=cfg.data.scale_coords,
+            ts_ratio=ts_ratio
+        )
     else:
         batch_preprocessor = BatchPreProcessor(aug_rotations=cfg.data.aug_rotations,
                                            scale_coords=cfg.data.scale_coords)

@@ -76,10 +76,10 @@ class StereoMetrics:
             sr, inv_sr, ez = get_stereochemistry_descriptor(mol)
             ref_sr, _, ref_ez = get_stereochemistry_descriptor(ref_mol)
 
-            # Check RS correctness
+            # Check RS correctness (absolute stereochemistry)
             if ref_sr:
                 total_rs += 1
-                if sr == ref_sr or sr == inv_sr:
+                if sr == ref_sr:
                     correct_rs += 1
 
             # Check EZ correctness

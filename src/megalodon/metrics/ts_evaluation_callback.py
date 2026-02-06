@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from lightning.pytorch.callbacks import Callback
 
+from megalodon.metrics.ts_stereo_metrics import TSStereoMetrics
+
 
 def convert_coords_to_np(out):
     """Convert model output to list of coordinate arrays."""
@@ -36,13 +38,19 @@ class TransitionStatesEvaluationCallback(Callback):
             timesteps: int = 100,
             scale_coords: float = 1.0,
             save_dir: str = 'ts_data',
+            compute_stereo_metrics: bool = True,
     ):
         super().__init__()
         self.max_molecules = max_molecules
         self.timesteps = timesteps
         self.scale_coords = scale_coords
         self.save_dir = Path(save_dir)
+        self.compute_stereo_metrics = compute_stereo_metrics
         self.molecules_data = []
+        
+        # Initialize stereo metrics
+        if self.compute_stereo_metrics:
+            self.stereo_metrics = TSStereoMetrics()
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx,
             dataloader_idx=0):
@@ -111,10 +119,31 @@ class TransitionStatesEvaluationCallback(Callback):
                 self.molecules_data.append(mol_data)
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        """Save collected molecules to disk."""
+        """Save collected molecules to disk and compute stereo metrics."""
         if self.molecules_data:
             if len(self.molecules_data) > self.max_molecules:
                 self.molecules_data = self.molecules_data[:self.max_molecules]
+            
+            # Compute stereochemistry metrics
+            if self.compute_stereo_metrics:
+                try:
+                    stereo_results = self.stereo_metrics(self.molecules_data)
+                    
+                    # Log metrics to WandB
+                    for key, value in stereo_results.items():
+                        pl_module.log(f"val/{key}", value, sync_dist=True, 
+                                     prog_bar=key.endswith('_score'))
+                    
+                    # Print summary
+                    print(f"\n🔬 TS Stereochemistry Evaluation:")
+                    print(f"   Reactant R/S: {stereo_results['ts_reactant_rs_score']:.3f} ({stereo_results['ts_n_reactant_rs']:.0f} samples)")
+                    print(f"   Reactant E/Z: {stereo_results['ts_reactant_ez_score']:.3f} ({stereo_results['ts_n_reactant_ez']:.0f} samples)")
+                    print(f"   Product R/S:  {stereo_results['ts_product_rs_score']:.3f} ({stereo_results['ts_n_product_rs']:.0f} samples)")
+                    print(f"   Product E/Z:  {stereo_results['ts_product_ez_score']:.3f} ({stereo_results['ts_n_product_ez']:.0f} samples)")
+                    print(f"   Overall R/S:  {stereo_results['ts_overall_rs_score']:.3f}")
+                    print(f"   Overall E/Z:  {stereo_results['ts_overall_ez_score']:.3f}")
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to compute stereo metrics: {e}")
 
             # Create save directory if it doesn't exist
             self.save_dir.mkdir(exist_ok=True)
