@@ -55,7 +55,28 @@ We then developed **LoQI** (Low-energy QM Informed conformer generative model), 
 
 ## Setup
 
-This setup has been tested on Ubuntu 22.04, but can be used across multiple platforms as PyTorch, Pytorch Geometric, and RdKit are widely supported. Installation will usually take up to 20 minutes. 
+Installation will usually take up to 20 minutes.
+
+### System and Hardware Requirements
+
+- OS tested by authors:
+  - Ubuntu 24.04 LTS (latest stable Ubuntu LTS at time of writing)
+- Other platforms:
+  - Expected to work, but if installation is not out-of-the-box, use the PyTorch Geometric installation guide for your exact Python/PyTorch/CUDA combination:
+    https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+- Tested inference hardware:
+  - GPU: NVIDIA RTX 3090 (24 GB VRAM)
+  - CPU: AMD Ryzen 9 5950X
+- Recommended GPU memory:
+  - 16-24 GB VRAM for comfortable inference/evaluation with larger molecules and higher batch sizes
+- Minimum practical GPU memory:
+  - 8 GB VRAM can run inference, but requires reduced batch sizes
+- CPU-only:
+  - Possible, but not recommended and not systematically studied by the authors
+
+OOM mitigation for larger molecules:
+- reduce inference batch size (`--batch_size` in sampling, or `data.inference_batch_size` in config)
+- if using evaluation/optimization, also reduce optimization batch size (`evaluation.energy_metrics_args.batchsize`)
 
 ### Prerequisites
 
@@ -74,10 +95,14 @@ cd LoQI
 conda create -n loqi python=3.10 -y
 conda activate loqi
 
-# Install dependencies
-pip install -e .
+# Install core dependencies
 pip install -r requirements.txt
+
+# Install this package in editable mode (adds src to PYTHONPATH)
+pip install -e .
 ```
+
+If you prefer a fully conda-based setup (recommended for RDKit), you can install RDKit via conda-forge before running `pip install -r requirements.txt`.
 
 ### Data Setup
 
@@ -91,19 +116,52 @@ The training and evaluation require the **ChEMBL3D** dataset.
 - Full ChEMBL3D dataset (250M+ conformers) will be released in a separate repository
 - Complete dataset processing scripts and pipeline
 
+Place downloaded assets in the repository with this layout:
+```text
+LoQI/
+  data/
+    loqi.ckpt
+    loqi_flow.ckpt
+    chembl3d_stereo/
+      processed/
+        ...
+```
 
+AimNet2 model path expected by configs:
+```text
+src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt
+```
 
 ---
 
+## Web App
+
+The repository includes a Streamlit interface for interactive conformer generation, postprocessing, and visualization.
+
+<div align="center">
+    <img width="100%" alt="LoQI App" src="assets/app.png"/>
+</div>
+
+Use the app-specific installation and usage instructions from `app/README.md` (recommended, as app dependencies are separated from core training/inference dependencies).  
+Quick start from repo root:
+
+```bash
+pip install -r app/requirements.txt
+streamlit run app/app.py
+```
+
 ## Usage
 
-Make sure that `src` content is available in your `PYTHONPATH` (e.g., `export PYTHONPATH="./src:$PYTHONPATH"`) if LoQI is not installed locally (pip install -e .). 
+Make sure that `src` content is available in your `PYTHONPATH` (e.g., `export PYTHONPATH="./src:$PYTHONPATH"`) if LoQI is not installed locally (`pip install -e .`). 
 
 ### Model Training
 
 ```bash
 # LoQI conformer generation model
 python scripts/train.py --config-name=loqi outdir=./outputs train.gpus=1 data.dataset_root="./chembl3d_data"
+
+# LoQI flow-matching conformer generation model
+python scripts/train.py --config-name=loqi_flow outdir=./outputs train.gpus=1 data.dataset_root="data/chembl3d_stereo"
 
 # Customize training parameters
 python scripts/train.py --config-name=loqi \
@@ -122,49 +180,36 @@ python scripts/train.py --config-name=loqi \
 ```bash
 # Generate conformers for a single molecule
 python scripts/sample_conformers.py \
-    --config ./conf/loqi/loqi.yaml \
-    --ckpt ./data/loqi.ckpt \
+    --config scripts/conf/loqi/loqi.yaml \
+    --ckpt data/loqi.ckpt \
     --input "c1ccccc1" \
-    --output ./outputs/benzene_conformers.sdf \
+    --output outputs/benzene_conformers.sdf \
     --n_confs 10 \
     --batch_size 1
 
-
-# Generate conformers with evaluation
+# Generate conformers with evaluation (requires 3D input, e.g., SDF with low energy conformer)
 python scripts/sample_conformers.py \
-    --config ./conf/loqi/loqi.yaml \
-    --ckpt ./data/loqi.ckpt \
-    --input "CCO" \
-    --output ./outputs/ethanol_conformers.sdf \
+    --config scripts/conf/loqi/loqi.yaml \
+    --ckpt data/loqi.ckpt \
+    --input data/ethanot_low_energy.sdf \
+    --output outputs/ethanol_conformers.sdf \
     --n_confs 100 \
-    --batch_size 10
+    --batch_size 10 \
+    --eval
 ```
 
-For reference, on an RTX 3090 GPU, inference for a typical ChEMBL molecule takes approximately 0.1 seconds per conformer when processed within a batch.  
+On the tested setup (RTX 3090 + Ryzen 9 5950X), inference for a typical ChEMBL molecule takes approximately 0.1 seconds per conformer when processed within a batch. See **System and Hardware Requirements** above for VRAM guidance and OOM mitigation.
 
-Note: Make sure you define correct paths for dataset and AimNet2 model in `loqi.yaml`. The relative path of AimNet2 model is `src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt`. 
+Note: Make sure you define correct paths for dataset and AimNet2 model in `loqi.yaml`. The relative path of AimNet2 model is `src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt`.
+
+Sampling steps: `--n_steps` defaults to 25. Diffusion models were trained with 25 steps and are not expected to work well for other values. Flow-matching models can be run with different step counts.
 
 #### Available Configurations
 
 **LoQI Models:**
 - `loqi.yaml` - LoQI stereochemistry-aware conformer generation model
 - `nextmol.yaml` - Alternative configuration for NextMol-style generation
-
-### Training Configuration
-
-You can easily override configuration parameters:
-
-```bash
-# Example with custom parameters
-python scripts/train.py --config-name=loqi \
-    outdir=./my_training \
-    run_name=my_experiment \
-    train.gpus=4 \
-    train.n_epochs=500 \
-    data.batch_size=64 \
-    data.dataset_root="/path/to/chembl3d" \
-    wandb_params.mode=online
-```
+- `loqi_flow.yaml` - LoQI flow-matching conformer generation model
 
 ---
 

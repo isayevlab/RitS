@@ -8,7 +8,7 @@ wandb_params:
   project: 'chembl3d_megalodon_diffusion'
 
 data:
-  dataset_root: "/home/fnikitin/LoQI/data/chembl3d_stereo"
+  dataset_root: "data/chembl3d_stereo"
   processed_folder: "processed"
   batch_size: &batch_size 150
   inference_batch_size: 150
@@ -117,7 +117,7 @@ evaluation:
   compute_stereo_metrics: True
   scale_coords: *scale_coords
   energy_metrics_args:
-    model_path: /home/fnikitin/Mega_ChMBL3D/mega_framework/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt
+    model_path: src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt
     batchsize: 100
     opt_metrics: True
     opt_params:

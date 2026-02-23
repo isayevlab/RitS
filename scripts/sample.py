@@ -41,8 +41,8 @@ def parse_args():
     # Generation settings
     parser.add_argument("--n_graphs", type=int, default=100,
                        help="Number of molecules to generate (default: 100)")
-    parser.add_argument("--batch_size", type=int, default=100,
-                       help="Batch size for generation (default: 100)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Batch size for generation. If omitted, uses data.inference_batch_size from config.")
     parser.add_argument("--timesteps", type=int, default=500,
                        help="Number of sampling timesteps (default: 500)")
     
@@ -176,16 +176,22 @@ def print_beautiful_results(result, n_graphs, timesteps, ckpt_path):
 
 def main():
     args = parse_args()
-    
+
+    # Load configuration
+    cfg = OmegaConf.load(args.config_path)
+    sample_batch_size = (
+        args.batch_size
+        if args.batch_size is not None
+        else int(getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", 100)))
+    )
+
     print(f"🚀 Starting molecule generation with Megalodon")
     print(f"📁 Checkpoint: {args.ckpt_path}")
     print(f"⚙️  Config: {args.config_path}")
     print(f"🎯 Target molecules: {args.n_graphs}")
+    print(f"📦 Batch size: {sample_batch_size}")
     print(f"⏱️  Timesteps: {args.timesteps}")
     print()
-
-    # Load configuration
-    cfg = OmegaConf.load(args.config_path)
 
     # Load model
     model = load_model(args.ckpt_path, cfg)
@@ -193,7 +199,7 @@ def main():
     model.eval()
 
     # Initialize data module and load statistics
-    datamodule = initialize_data_module(cfg, args.batch_size)
+    datamodule = initialize_data_module(cfg, sample_batch_size)
     
     try:
         # Load statistics separately
@@ -206,7 +212,7 @@ def main():
         print(f"Error loading statistics: {e}")
         statistics = None
     
-    eval_callback = initialize_eval_callback(cfg, statistics, args.n_graphs, args.batch_size, args.timesteps)
+    eval_callback = initialize_eval_callback(cfg, statistics, args.n_graphs, sample_batch_size, args.timesteps)
 
     # Evaluate molecules
     print(f"🧬 Generating {args.n_graphs} molecules...")

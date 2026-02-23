@@ -1,4 +1,4 @@
-run_name: 'chembl3d_stereo_25_v3'
+run_name: 'loqi_flow_v1'
 outdir: null
 resume: null
 ema: True
@@ -18,36 +18,42 @@ data:
   scale_coords: &scale_coords 1.0
 
 loss:
+  use_loss_clamps: True
+  loss_clamp_epoch_threshold: 10
+  loss_clamps:
+    ts_coord: 1.0
   variables:
     - variable_name: 'x'
-      loss_scale: 3.0
+      loss_scale: 1.0
       aggregate: 'mean'
       continuous: True
+      loss_type: 'mse'
       use_distance: null
       distance_scale: null
 
 interpolant:
   timesteps: &timesteps 25
-  time_type: &time_type "discrete" #["discrete, "continuous]
-  scheduler_type: &scheduler_type "cosine_adaptive" #["cosine_adaptive, "linear"]
-  sample_time_method: "uniform" # ["symmetric", "uniform", "stab_mode", "logit_normal", "beta"]
-  sample_time_mean: 0 # Used in stab_mode and logit_normal
-  sample_time_scale: 0.81 # Used in stab_mode and logit_normal
-  global_variable_name: 'x' # variable that is specficed below to be used for sampling time and loss sampling
-  min_t: &min_t 0
+  time_type: &time_type "continuous"
+  sample_time_method: "uniform"
+  sample_time_mean: 0
+  sample_time_scale: 1.0
+  global_variable_name: 'x'
+  min_t: &min_t 0.0
   variables:
     - variable_name: 'x'
-      interpolant_type: 'continuous_diffusion' #["continuous_diffusion", "continuous_flow_matching"]
-      diffusion_type: 'vdm'
+      interpolant_type: 'continuous_flow_matching' #["continuous_diffusion", "continuous_flow_matching"]
+      prediction_type: 'velocity'
+      optimal_transport: 'rigid' #'scale_ot'
       prior_type: 'gaussian'
       timesteps: *timesteps
       num_classes: 3
-      scheduler_type: *scheduler_type
+      scheduler_type: "linear"
       scheduler_cut: False
       time_type: *time_type
-      nu: 2.5
-      com_free: True
       min_t: *min_t
+      com_free: True
+      noise_sigma: 0.0
+      inference_noise_sigma: 0.
     - variable_name: 'h'
       interpolant_type: "discrete_null" #["discrete_diffusion", "discrete_flow_matching"]
       num_classes: &num_atoms 17
@@ -80,18 +86,9 @@ dynamics:
     timesteps: *timesteps
     time_type: *time_type
 
-self_conditioning:
-  name: "base"
-  variables:
-    - variable_name: x
-      hidden_dims: 32
-      fuse_softmax: False
-      vector: True
-      clamp_min: -100
-      clamp_max: 100
-
 sample:
-  node_distribution: "${data.dataset_root}/processed/train_n_h.pickle" # null
+  node_distribution: "${data.dataset_root}/processed/train_n_h.pickle"
+  return_step_output: True
 
 train:
   seed: 42

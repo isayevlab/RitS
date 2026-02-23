@@ -2,9 +2,8 @@ import os
 import pickle
 from argparse import ArgumentParser
 from rdkit import Chem
-from rdkit.Chem import AllChem
 from tqdm import tqdm
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
 import torch
 import numpy as np
 from omegaconf import OmegaConf
@@ -121,7 +120,7 @@ def raw_to_pyg(rdkit_mol, coords=None, use_3d=True):
     return mol_to_torch_geometric(rdkit_mol, smiles, use_3d=use_3d)
 
 
-def load_rdkit_molecules(input_path_or_smiles, use_3d=True):
+def load_rdkit_molecules(input_path_or_smiles):
     if os.path.isfile(input_path_or_smiles):
         if input_path_or_smiles.endswith(".sdf"):
             suppl = Chem.SDMolSupplier(input_path_or_smiles, removeHs=False, sanitize=False)
@@ -133,15 +132,7 @@ def load_rdkit_molecules(input_path_or_smiles, use_3d=True):
             for smi in smiles_list:
                 mol = Chem.MolFromSmiles(smi)
                 if mol:
-                    mol = Chem.AddHs(mol)
-                    if use_3d:
-                        try:
-                            AllChem.EmbedMolecule(mol, randomSeed=42)
-                            mols.append(mol)
-                        except:
-                            continue
-                    else:
-                        mols.append(mol)
+                    mols.append(Chem.AddHs(mol))
         else:
             raise ValueError(f"Unsupported input format: {input_path_or_smiles}")
     else:
@@ -149,10 +140,7 @@ def load_rdkit_molecules(input_path_or_smiles, use_3d=True):
         mol = Chem.MolFromSmiles(input_path_or_smiles)
         if mol is None:
             raise ValueError("Invalid SMILES string provided.")
-        mol = Chem.AddHs(mol)
-        if use_3d:
-            AllChem.EmbedMolecule(mol, randomSeed=42)
-        mols = [mol]
+        mols = [Chem.AddHs(mol)]
     return mols
 
 
@@ -163,15 +151,6 @@ def mols_to_data_list(mols, n_confs=1, use_3d=True):
         if mol is None or mol.GetNumAtoms() == 0:
             continue
             
-        if use_3d and mol.GetNumConformers() == 0:
-            try:
-                AllChem.EmbedMolecule(mol, randomSeed=42)
-            except:
-                if not use_3d:
-                    pass  # Continue with zero coordinates
-                else:
-                    continue
-                    
         pos = mol.GetConformer().GetPositions() if use_3d and mol.GetNumConformers() > 0 else None
 
         for _ in range(n_confs):
@@ -187,13 +166,33 @@ def main():
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--n_confs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Sampling batch size. If omitted, uses data.inference_batch_size from config.",
+    )
+    parser.add_argument(
+        "--n_steps",
+        type=int,
+        default=25,
+        help=(
+            "Sampling steps (default: 25). Diffusion models were trained with 25 steps and "
+            "are not expected to work well for other values. Flow-matching models can be "
+            "run with different step counts."
+        ),
+    )
     parser.add_argument("--no_3d", action="store_true", help="Skip 3D embedding generation")
-    parser.add_argument("--skip_eval", action="store_true", help="Skip evaluation")
+    parser.add_argument("--eval", action="store_true", help="Run evaluation (off by default)")
     args = parser.parse_args()
 
     # Load model
     cfg = OmegaConf.load(args.config)
+    sample_batch_size = (
+        args.batch_size
+        if args.batch_size is not None
+        else int(getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", 32)))
+    )
     model = Graph3DInterpolantModel.load_from_checkpoint(
         args.ckpt,
         loss_params=cfg.loss,
@@ -201,26 +200,32 @@ def main():
         sampling_params=cfg.sample,
         batch_preporcessor=BatchPreProcessor(cfg.data.aug_rotations, cfg.data.scale_coords)
     )
-    model = model.to("cuda").eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device).eval()
 
     # Load molecules and replicate them n_confs times
-    use_3d = not args.no_3d
-    mols = load_rdkit_molecules(args.input, use_3d=use_3d)
+    # Only use 3D if provided in input (e.g., SDF with conformers) and not explicitly disabled
+    input_is_sdf = os.path.isfile(args.input) and args.input.endswith(".sdf")
+    mols = load_rdkit_molecules(args.input)
+    has_3d_input = any(mol.GetNumConformers() > 0 for mol in mols) if input_is_sdf else False
+    use_3d = (not args.no_3d) and has_3d_input
     data_list = mols_to_data_list(mols, n_confs=args.n_confs, use_3d=use_3d)
-    loader = DataLoader(data_list, batch_size=args.batch_size)
+    loader = DataLoader(data_list, batch_size=sample_batch_size)
 
     # Sampling
     generated = []
-    references = [] if not args.skip_eval else None
+    skip_eval = not args.eval
+    references = [] if not skip_eval else None
     ids = []
+    timesteps = args.n_steps
     
     for batch in tqdm(loader, desc="Sampling"):
         batch = batch.to(model.device)
-        sample = model.sample(batch=batch, timesteps=cfg.interpolant.timesteps, pre_format=True)
+        sample = model.sample(batch=batch, timesteps=timesteps, pre_format=True)
         coords_list = convert_coords_to_np(sample)
         mols_gen = [write_coords_to_mol(mol, coords) for mol, coords in zip(batch["mol"], coords_list)]
         generated.extend(mols_gen)
-        if not args.skip_eval:
+        if not skip_eval:
             references.extend(batch["mol"])
         ids.extend([m.GetProp("_Name") if m.HasProp("_Name") else "NA" for m in batch["mol"]])
 
@@ -239,10 +244,10 @@ def main():
             pickle.dump(output_dict, f)
 
     # Evaluate only if references are available and evaluation is not skipped
-    if not args.skip_eval and references:
+    if not skip_eval and references and has_3d_input:
         stats = Statistics.load_statistics(cfg.data.dataset_root + "/processed", "train")
         eval_cb = ConformerEvaluationCallback(
-            timesteps=cfg.evaluation.timesteps,
+            timesteps=timesteps,
             compute_3D_metrics=cfg.evaluation.compute_3D_metrics,
             compute_energy_metrics=cfg.evaluation.compute_energy_metrics,
             energy_metrics_args=OmegaConf.to_container(cfg.evaluation.energy_metrics_args,

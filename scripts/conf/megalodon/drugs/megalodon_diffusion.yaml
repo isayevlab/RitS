@@ -8,7 +8,7 @@ wandb_params:
   project: 'Megalodon'
 
 data:
-  dataset_root: "/home/fnikitin/Megalodon/data/drugs"
+  dataset_root: "data/drugs"
   processed_folder: "processed"
   batch_size: &batch_size 85
   inference_batch_size: 85
