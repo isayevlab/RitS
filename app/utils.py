@@ -7,8 +7,8 @@ import time
 import torch
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 
 # Add src to path for imports
 sys.path.append('/home/fnikitin/LoQI/src')
@@ -16,37 +16,11 @@ sys.path.append('/home/fnikitin/LoQI/src')
 from megalodon.metrics.conformer_evaluation_callback import (
     write_coords_to_mol, convert_coords_to_np
 )
+from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
+from megalodon.inference.validation import validate_smiles
 from megalodon.metrics.molecule_evaluation_callback import full_atom_encoder
 from megalodon.metrics.aimnet2.check_topology import check_topology
 from megalodon.metrics.preserved_stereo import get_stereochemistry_descriptor
-
-
-def smiles_to_mol(smiles, add_hs=True, embed_3d=True):
-    """
-    Convert SMILES string to RDKit molecule with optional 3D embedding.
-    
-    Args:
-        smiles (str): SMILES string
-        add_hs (bool): Whether to add hydrogens
-        embed_3d (bool): Whether to embed 3D coordinates
-        
-    Returns:
-        Chem.Mol or None: RDKit molecule object
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    
-    if add_hs:
-        mol = Chem.AddHs(mol)
-    
-    if embed_3d:
-        try:
-            AllChem.EmbedMolecule(mol, randomSeed=42)
-        except:
-            return None
-    
-    return mol
 
 
 def add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index=None, edge_attr=None, from_3D=True):
@@ -153,7 +127,16 @@ def mol_to_torch_geometric_simple(mol, smiles):
     )
 
 
-def generate_conformers_batch(smiles, model, cfg, n_confs=10, generation_batch_size=None):
+def generate_conformers_batch(
+        smiles,
+        model,
+        cfg,
+        n_confs=10,
+        generation_batch_size=None,
+        atom_aware_batching=None,
+        shuffle=None,
+        target_molecule_size=None,
+):
     """
     Generate multiple conformers for a given SMILES using the LoQI model.
     
@@ -167,11 +150,13 @@ def generate_conformers_batch(smiles, model, cfg, n_confs=10, generation_batch_s
         tuple: (generated molecules, reference molecules, seconds per structure, error message)
     """
     try:
-        # Create base molecule
-        mol = smiles_to_mol(smiles, add_hs=True, embed_3d=True)
+        # Validate and revalidate input SMILES first.
+        mol, _, validation_error = validate_smiles(smiles)
+        if validation_error is not None:
+            return None, None, None, validation_error
         if mol is None:
-            return None, None, "Invalid SMILES string or failed to embed 3D coordinates"
-        
+            return None, None, None, "SMILES validation failed."
+
         # Create data list for batch processing
         data_list = []
         reference_mols = []
@@ -185,15 +170,30 @@ def generate_conformers_batch(smiles, model, cfg, n_confs=10, generation_batch_s
                 getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", n_confs))
             )
         generation_batch_size = max(1, int(generation_batch_size))
+        if atom_aware_batching is None:
+            atom_aware_batching = True
+        if shuffle is None:
+            shuffle = False
+        if target_molecule_size is None:
+            target_molecule_size = 50
 
         # Generate conformers in batches
         timesteps = getattr(cfg.interpolant, "timesteps", 25)
         t0 = time.perf_counter()
         coords_list = []
+        if atom_aware_batching:
+            sampler = AdaptiveBatchSampler(
+                data_list,
+                reference_batch_size=generation_batch_size,
+                shuffle=shuffle,
+                reference_size=target_molecule_size,
+            )
+            loader = DataLoader(data_list, batch_sampler=sampler)
+        else:
+            loader = DataLoader(data_list, batch_size=generation_batch_size, shuffle=shuffle)
         with torch.no_grad():
-            for start in range(0, len(data_list), generation_batch_size):
-                chunk = data_list[start:start + generation_batch_size]
-                batch = Batch.from_data_list(chunk).to(model.device)
+            for batch in loader:
+                batch = batch.to(model.device)
                 sample = model.sample(batch=batch, timesteps=timesteps, pre_format=True)
                 coords_list.extend(convert_coords_to_np(sample))
         elapsed_s = time.perf_counter() - t0

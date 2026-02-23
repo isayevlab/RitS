@@ -1,6 +1,6 @@
 import os
 import pickle
-from argparse import ArgumentParser
+from argparse import ArgumentParser, BooleanOptionalAction
 from rdkit import Chem
 from tqdm import tqdm
 from torch_geometric.loader import DataLoader
@@ -11,8 +11,11 @@ from copy import deepcopy
 from torch_geometric.data import Data
 
 from megalodon.models.module import Graph3DInterpolantModel
+from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
 from megalodon.data.batch_preprocessor import BatchPreProcessor
 from megalodon.data.statistics import Statistics
+from megalodon.inference.validation import validate_rdkit_mol, validate_smiles
+from megalodon.metrics.molecule_metrics_aimnet2 import MoleculeAIMNet2Metrics
 from megalodon.metrics.conformer_evaluation_callback import (
     ConformerEvaluationCallback, write_coords_to_mol, convert_coords_to_np
 )
@@ -76,7 +79,7 @@ def add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index=None, edge_attr=None, 
     return edge_index, edge_attr
 
 
-def mol_to_torch_geometric(mol, smiles, use_3d=True):
+def mol_to_torch_geometric(mol, smiles, use_3d_input=False):
     Chem.SanitizeMol(mol)
     Chem.Kekulize(mol, clearAromaticFlags=True)
     adj = torch.from_numpy(Chem.rdmolops.GetAdjacencyMatrix(mol, useBO=True))
@@ -85,7 +88,7 @@ def mol_to_torch_geometric(mol, smiles, use_3d=True):
     bond_types[bond_types == 1.5] = 4
     edge_attr = bond_types.to(torch.uint8)
 
-    if use_3d and mol.GetNumConformers() > 0:
+    if use_3d_input and mol.GetNumConformers() > 0:
         pos = torch.tensor(mol.GetConformer().GetPositions()).float()
     else:
         pos = torch.zeros((mol.GetNumAtoms(), 3)).float()
@@ -95,7 +98,9 @@ def mol_to_torch_geometric(mol, smiles, use_3d=True):
 
     chi_bonds = [7, 8]
     ez_bonds = {Chem.BondStereo.STEREOE: 5, Chem.BondStereo.STEREOZ: 6}
-    edge_index, edge_attr = add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index, edge_attr, from_3D=use_3d)
+    edge_index, edge_attr = add_stereo_bonds(
+        mol, chi_bonds, ez_bonds, edge_index, edge_attr, from_3D=use_3d_input
+    )
 
     return Data(
         x=atom_types,
@@ -109,54 +114,134 @@ def mol_to_torch_geometric(mol, smiles, use_3d=True):
     )
 
 
-def raw_to_pyg(rdkit_mol, coords=None, use_3d=True):
-    if use_3d and coords is not None:
-        rdkit_mol.RemoveAllConformers()
-        conf = Chem.Conformer(rdkit_mol.GetNumAtoms())
-        for i in range(rdkit_mol.GetNumAtoms()):
-            conf.SetAtomPosition(i, tuple(coords[i]))
-        rdkit_mol.AddConformer(conf)
+def raw_to_pyg(rdkit_mol, use_3d_input=False):
     smiles = Chem.MolToSmiles(rdkit_mol)
-    return mol_to_torch_geometric(rdkit_mol, smiles, use_3d=use_3d)
+    return mol_to_torch_geometric(rdkit_mol, smiles, use_3d_input=use_3d_input)
 
 
-def load_rdkit_molecules(input_path_or_smiles):
+def load_rdkit_molecules(input_path_or_smiles, add_hs=True):
+    errors = []
     if os.path.isfile(input_path_or_smiles):
         if input_path_or_smiles.endswith(".sdf"):
             suppl = Chem.SDMolSupplier(input_path_or_smiles, removeHs=False, sanitize=False)
-            mols = [m for m in suppl if m is not None]
+            mols = []
+            for idx, mol in enumerate(suppl):
+                if mol is None:
+                    errors.append(f"SDF entry {idx}: RDKit failed to read molecule.")
+                    continue
+                _, err = validate_rdkit_mol(mol, add_hs=add_hs)
+                if err is not None:
+                    errors.append(f"SDF entry {idx}: {err}")
+                    continue
+                mols.append(mol)
         elif input_path_or_smiles.endswith((".smi", ".smiles")):
             with open(input_path_or_smiles) as f:
                 smiles_list = [line.strip().split()[0] for line in f if line.strip()]
             mols = []
-            for smi in smiles_list:
-                mol = Chem.MolFromSmiles(smi)
-                if mol:
-                    mols.append(Chem.AddHs(mol))
+            for i, smi in enumerate(smiles_list):
+                mol, _, err = validate_smiles(smi, add_hs=add_hs)
+                if err is not None:
+                    errors.append(f"SMILES line {i + 1}: {err}")
+                    continue
+                mols.append(mol)
         else:
             raise ValueError(f"Unsupported input format: {input_path_or_smiles}")
     else:
         # Treat it as a SMILES string
-        mol = Chem.MolFromSmiles(input_path_or_smiles)
-        if mol is None:
-            raise ValueError("Invalid SMILES string provided.")
-        mols = [Chem.AddHs(mol)]
-    return mols
+        mol, _, err = validate_smiles(input_path_or_smiles, add_hs=add_hs)
+        if err is not None:
+            raise ValueError(f"Invalid SMILES string: {err}")
+        mols = [mol]
+    return mols, errors
 
 
-def mols_to_data_list(mols, n_confs=1, use_3d=True):
+def mols_to_data_list(mols, n_confs=1, use_3d_input=False):
     """Replicate each molecule n_confs times and convert to torch geometric Data objects."""
     data_list = []
     for mol in mols:
         if mol is None or mol.GetNumAtoms() == 0:
             continue
             
-        pos = mol.GetConformer().GetPositions() if use_3d and mol.GetNumConformers() > 0 else None
-
         for _ in range(n_confs):
-            data = raw_to_pyg(Chem.Mol(mol), pos, use_3d=use_3d)
+            data = raw_to_pyg(Chem.Mol(mol), use_3d_input=use_3d_input)
             data_list.append(data)
     return data_list
+
+
+def build_sampling_loader(
+        data_list,
+        sample_batch_size,
+        atom_aware_batching=True,
+        shuffle=False,
+        target_molecule_size=50,
+):
+    if atom_aware_batching:
+        sampler = AdaptiveBatchSampler(
+            data_list,
+            reference_batch_size=sample_batch_size,
+            shuffle=shuffle,
+            reference_size=target_molecule_size,
+        )
+        return DataLoader(data_list, batch_sampler=sampler)
+    return DataLoader(data_list, batch_size=sample_batch_size, shuffle=shuffle)
+
+
+def optimize_with_aimnet(
+        molecules,
+        cfg,
+        opt_batch_size=None,
+        fmax=0.05,
+        max_nstep=250,
+):
+    aimnet_path = cfg.evaluation.energy_metrics_args.model_path
+    if not os.path.exists(str(aimnet_path)):
+        return None, None, f"AIMNet2 model not found: {aimnet_path}"
+    if opt_batch_size is None:
+        opt_batch_size = int(getattr(cfg.evaluation.energy_metrics_args, "batchsize", 100))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    energy_metrics = MoleculeAIMNet2Metrics(
+        model_path=str(aimnet_path),
+        batchsize=int(opt_batch_size),
+        opt_metrics=True,
+        opt_params={"fmax": float(fmax), "max_nstep": int(max_nstep)},
+        device=device,
+    )
+    try:
+        _, _, opt_mols, opt_energies = energy_metrics(
+            molecules, reference_molecules=None, return_molecules=True
+        )
+        return opt_mols, opt_energies, None
+    except Exception as exc:
+        return None, None, f"Optimization failed: {exc}"
+
+
+def select_unique_with_irmsd(molecules, rthr=0.125):
+    try:
+        from irmsd import sorter_irmsd_rdkit  # type: ignore
+    except Exception:
+        return None, None, "iRMSD is not installed. Install with: pip install irmsd"
+    try:
+        # iinversion=2 disables inversion.
+        groups, _ = sorter_irmsd_rdkit(
+            molecules, rthr=float(rthr), iinversion=2, allcanon=True, printlvl=0
+        )
+        groups = np.asarray(groups).reshape(-1)
+        if groups.shape[0] != len(molecules):
+            return None, None, (
+                f"iRMSD returned unexpected group shape {groups.shape}; expected ({len(molecules)},)."
+            )
+        selected_indices = []
+        seen = set()
+        for idx, gid in enumerate(groups.tolist()):
+            if gid not in seen:
+                seen.add(gid)
+                selected_indices.append(idx)
+        if not selected_indices:
+            return None, None, "iRMSD did not produce any unique representatives."
+        unique_mols = [molecules[i] for i in selected_indices]
+        return unique_mols, selected_indices, None
+    except Exception as exc:
+        return None, None, f"iRMSD pruning failed: {exc}"
 
 
 def main():
@@ -182,8 +267,52 @@ def main():
             "run with different step counts."
         ),
     )
-    parser.add_argument("--no_3d", action="store_true", help="Skip 3D embedding generation")
+    parser.add_argument(
+        "--add-hs",
+        action=BooleanOptionalAction,
+        default=True,
+        help=(
+            "Add hydrogens during SMILES validation/featurization. "
+            "Use --no-add-hs when input already contains explicit hydrogens."
+        ),
+    )
     parser.add_argument("--eval", action="store_true", help="Run evaluation (off by default)")
+    parser.add_argument(
+        "--postprocess",
+        choices=["none", "optimization", "optimization+irmsd"],
+        default="none",
+        help="Optional postprocessing of generated conformers.",
+    )
+    parser.add_argument(
+        "--optimization_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for AIMNet2 optimization (default: cfg.evaluation.energy_metrics_args.batchsize).",
+    )
+    parser.add_argument("--opt_fmax", type=float, default=0.05, help="Optimization force threshold.")
+    parser.add_argument("--opt_max_nstep", type=int, default=250, help="Maximum optimization steps.")
+    parser.add_argument("--irmsd_rthr", type=float, default=0.125, help="iRMSD pruning threshold.")
+    parser.add_argument(
+        "--atom-aware-batching",
+        action=BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable atom-aware batching with AdaptiveBatchSampler. "
+            "Use --no-atom-aware-batching to disable."
+        ),
+    )
+    parser.add_argument(
+        "--target-molecule-size",
+        type=int,
+        default=50,
+        help="Target molecule size for atom-aware batching (default: 50).",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Shuffle conformer replicas before batching. Use --no-shuffle to disable.",
+    )
     args = parser.parse_args()
 
     # Load model
@@ -193,6 +322,9 @@ def main():
         if args.batch_size is not None
         else int(getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", 32)))
     )
+    atom_aware_batching = bool(args.atom_aware_batching)
+    shuffle = bool(args.shuffle)
+    target_molecule_size = int(args.target_molecule_size)
     model = Graph3DInterpolantModel.load_from_checkpoint(
         args.ckpt,
         loss_params=cfg.loss,
@@ -203,14 +335,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
 
-    # Load molecules and replicate them n_confs times
-    # Only use 3D if provided in input (e.g., SDF with conformers) and not explicitly disabled
+    # Load molecules and replicate them n_confs times.
+    # Use provided 3D coordinates only for SDF inputs that already contain conformers.
     input_is_sdf = os.path.isfile(args.input) and args.input.endswith(".sdf")
-    mols = load_rdkit_molecules(args.input)
+    mols, validation_errors = load_rdkit_molecules(args.input, add_hs=args.add_hs)
+    for err in validation_errors:
+        print(f"WARNING: {err}")
+    if not mols:
+        raise ValueError("No valid molecules left after validation/revalidation checks.")
     has_3d_input = any(mol.GetNumConformers() > 0 for mol in mols) if input_is_sdf else False
-    use_3d = (not args.no_3d) and has_3d_input
-    data_list = mols_to_data_list(mols, n_confs=args.n_confs, use_3d=use_3d)
-    loader = DataLoader(data_list, batch_size=sample_batch_size)
+    use_3d_input = input_is_sdf and has_3d_input
+    data_list = mols_to_data_list(mols, n_confs=args.n_confs, use_3d_input=use_3d_input)
+    loader = build_sampling_loader(
+        data_list=data_list,
+        sample_batch_size=sample_batch_size,
+        atom_aware_batching=atom_aware_batching,
+        shuffle=shuffle,
+        target_molecule_size=target_molecule_size,
+    )
 
     # Sampling
     generated = []
@@ -229,15 +371,52 @@ def main():
             references.extend(batch["mol"])
         ids.extend([m.GetProp("_Name") if m.HasProp("_Name") else "NA" for m in batch["mol"]])
 
+    energies = None
+    if args.postprocess in {"optimization", "optimization+irmsd"}:
+        optimized, energies, opt_error = optimize_with_aimnet(
+            generated,
+            cfg,
+            opt_batch_size=args.optimization_batch_size,
+            fmax=args.opt_fmax,
+            max_nstep=args.opt_max_nstep,
+        )
+        if opt_error is not None:
+            raise RuntimeError(opt_error)
+        generated = optimized
+        if hasattr(energies, "detach"):
+            energies = energies.detach().cpu().numpy()
+        else:
+            energies = np.asarray(energies)
+        print(f"Optimization complete: {len(generated)} conformers.")
+
+    if args.postprocess == "optimization+irmsd":
+        unique_mols, selected_indices, irmsd_error = select_unique_with_irmsd(
+            generated, rthr=args.irmsd_rthr
+        )
+        if irmsd_error is not None:
+            raise RuntimeError(irmsd_error)
+        generated = unique_mols
+        ids = [ids[i] for i in selected_indices]
+        if references is not None:
+            references = [references[i] for i in selected_indices]
+        if energies is not None:
+            energies = energies[selected_indices]
+        print(f"iRMSD unique selection complete: {len(generated)} conformers.")
+
     # Save output
     if args.output.endswith(".sdf"):
         from rdkit.Chem import SDWriter
         writer = SDWriter(args.output)
-        for mol in generated:
+        ev2kcalpermol = 23.060547830619026
+        for idx, mol in enumerate(generated):
+            if energies is not None:
+                mol.SetProp("Energy_kcal_mol", f"{float(energies[idx]) * ev2kcalpermol:.6f}")
             writer.write(mol)
         writer.close()
     else:
         output_dict = {"generated": generated, "ids": ids}
+        if energies is not None:
+            output_dict["energies"] = energies
         if references is not None:
             output_dict["reference"] = references
         with open(args.output, "wb") as f:
