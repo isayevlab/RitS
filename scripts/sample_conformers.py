@@ -14,7 +14,7 @@ from megalodon.models.module import Graph3DInterpolantModel
 from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
 from megalodon.data.batch_preprocessor import BatchPreProcessor
 from megalodon.data.statistics import Statistics
-from megalodon.inference.validation import validate_rdkit_mol, validate_smiles
+from megalodon.inference.validation import SUPPORTED_ELEMENTS, validate_rdkit_mol, validate_smiles
 from megalodon.metrics.molecule_metrics_aimnet2 import MoleculeAIMNet2Metrics
 from megalodon.metrics.conformer_evaluation_callback import (
     ConformerEvaluationCallback, write_coords_to_mol, convert_coords_to_np
@@ -120,6 +120,40 @@ def raw_to_pyg(rdkit_mol, use_3d_input=False):
 
 
 def load_rdkit_molecules(input_path_or_smiles, add_hs=True):
+    def validate_smiles_allow_disconnected(smiles, add_hs=True):
+        mol, canonical, err = validate_smiles(smiles, add_hs=add_hs)
+        if err is None:
+            return mol, canonical, None, None
+        if "Disconnected fragments are not supported" not in str(err):
+            return None, None, err, None
+
+        # Permissive fallback for disconnected systems (e.g., dimers).
+        mol_raw = Chem.MolFromSmiles(str(smiles).strip())
+        if mol_raw is None:
+            return None, None, f"RDKit failed to parse SMILES: {smiles!r}.", None
+        canonical = Chem.MolToSmiles(mol_raw, canonical=True, isomericSmiles=True)
+        mol_roundtrip = Chem.MolFromSmiles(canonical)
+        if mol_roundtrip is None:
+            return None, None, f"Revalidation failed after canonicalization: {canonical!r}.", None
+        mol_checked = Chem.AddHs(mol_roundtrip) if add_hs else mol_roundtrip
+        for atom in mol_checked.GetAtoms():
+            symbol = atom.GetSymbol()
+            if symbol not in SUPPORTED_ELEMENTS:
+                return None, None, (
+                    f"Unsupported element: '{symbol}'. Supported: "
+                    f"{', '.join(sorted(SUPPORTED_ELEMENTS))}."
+                ), None
+            if atom.GetNumRadicalElectrons() > 0:
+                return None, None, (
+                    f"Radical electrons are not supported "
+                    f"(atom {atom.GetIdx()} {atom.GetSymbol()})."
+                ), None
+        warning = (
+            "Disconnected fragments detected. Proceeding in permissive mode "
+            "(experimental for dimers/multimers)."
+        )
+        return mol_checked, canonical, None, warning
+
     errors = []
     if os.path.isfile(input_path_or_smiles):
         if input_path_or_smiles.endswith(".sdf"):
@@ -139,18 +173,22 @@ def load_rdkit_molecules(input_path_or_smiles, add_hs=True):
                 smiles_list = [line.strip().split()[0] for line in f if line.strip()]
             mols = []
             for i, smi in enumerate(smiles_list):
-                mol, _, err = validate_smiles(smi, add_hs=add_hs)
+                mol, _, err, warning = validate_smiles_allow_disconnected(smi, add_hs=add_hs)
                 if err is not None:
                     errors.append(f"SMILES line {i + 1}: {err}")
                     continue
+                if warning is not None:
+                    errors.append(f"SMILES line {i + 1}: WARNING: {warning}")
                 mols.append(mol)
         else:
             raise ValueError(f"Unsupported input format: {input_path_or_smiles}")
     else:
         # Treat it as a SMILES string
-        mol, _, err = validate_smiles(input_path_or_smiles, add_hs=add_hs)
+        mol, _, err, warning = validate_smiles_allow_disconnected(input_path_or_smiles, add_hs=add_hs)
         if err is not None:
             raise ValueError(f"Invalid SMILES string: {err}")
+        if warning is not None:
+            print(f"WARNING: {warning}")
         mols = [mol]
     return mols, errors
 
@@ -216,6 +254,14 @@ def optimize_with_aimnet(
 
 
 def select_unique_with_irmsd(molecules, rthr=0.125):
+    if molecules is None:
+        return None, None, "No molecules provided for iRMSD pruning."
+    if len(molecules) == 0:
+        return [], [], None
+    if len(molecules) == 1:
+        # Nothing to prune for a single conformer.
+        return molecules, [0], None
+
     try:
         from irmsd import sorter_irmsd_rdkit  # type: ignore
     except Exception:
@@ -289,8 +335,18 @@ def main():
         default=None,
         help="Batch size for AIMNet2 optimization (default: cfg.evaluation.energy_metrics_args.batchsize).",
     )
-    parser.add_argument("--opt_fmax", type=float, default=0.05, help="Optimization force threshold.")
-    parser.add_argument("--opt_max_nstep", type=int, default=250, help="Maximum optimization steps.")
+    parser.add_argument(
+        "--opt_fmax",
+        type=float,
+        default=None,
+        help="Optimization force threshold (default: cfg.evaluation.energy_metrics_args.opt_params.fmax).",
+    )
+    parser.add_argument(
+        "--opt_max_nstep",
+        type=int,
+        default=None,
+        help="Maximum optimization steps (default: cfg.evaluation.energy_metrics_args.opt_params.max_nstep).",
+    )
     parser.add_argument("--irmsd_rthr", type=float, default=0.125, help="iRMSD pruning threshold.")
     parser.add_argument(
         "--atom-aware-batching",
@@ -317,6 +373,17 @@ def main():
 
     # Load model
     cfg = OmegaConf.load(args.config)
+    cfg_opt_params = getattr(getattr(cfg.evaluation, "energy_metrics_args", None), "opt_params", None)
+    opt_fmax = (
+        float(args.opt_fmax)
+        if args.opt_fmax is not None
+        else float(getattr(cfg_opt_params, "fmax", 0.05))
+    )
+    opt_max_nstep = (
+        int(args.opt_max_nstep)
+        if args.opt_max_nstep is not None
+        else int(getattr(cfg_opt_params, "max_nstep", 250))
+    )
     sample_batch_size = (
         args.batch_size
         if args.batch_size is not None
@@ -377,8 +444,8 @@ def main():
             generated,
             cfg,
             opt_batch_size=args.optimization_batch_size,
-            fmax=args.opt_fmax,
-            max_nstep=args.opt_max_nstep,
+            fmax=opt_fmax,
+            max_nstep=opt_max_nstep,
         )
         if opt_error is not None:
             raise RuntimeError(opt_error)

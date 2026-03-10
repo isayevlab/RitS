@@ -17,7 +17,7 @@ from megalodon.metrics.conformer_evaluation_callback import (
     write_coords_to_mol, convert_coords_to_np
 )
 from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
-from megalodon.inference.validation import validate_smiles
+from megalodon.inference.validation import SUPPORTED_ELEMENTS, validate_smiles
 from megalodon.metrics.molecule_evaluation_callback import full_atom_encoder
 from megalodon.metrics.aimnet2.check_topology import check_topology
 from megalodon.metrics.preserved_stereo import get_stereochemistry_descriptor
@@ -149,11 +149,44 @@ def generate_conformers_batch(
     Returns:
         tuple: (generated molecules, reference molecules, seconds per structure, error message)
     """
+    def _validate_smiles_with_disconnected_fallback(input_smiles):
+        mol_valid, _, validation_error = validate_smiles(input_smiles)
+        if validation_error is None:
+            return mol_valid, None
+        if "Disconnected fragments are not supported" not in str(validation_error):
+            return None, validation_error
+
+        # Fallback validation path for disconnected systems (e.g., dimers).
+        mol = Chem.MolFromSmiles(str(input_smiles).strip())
+        if mol is None:
+            return None, f"RDKit failed to parse SMILES: {input_smiles!r}."
+        canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+        mol_roundtrip = Chem.MolFromSmiles(canonical)
+        if mol_roundtrip is None:
+            return None, f"Revalidation failed after canonicalization: {canonical!r}."
+        mol_h = Chem.AddHs(mol_roundtrip)
+        for atom in mol_h.GetAtoms():
+            symbol = atom.GetSymbol()
+            if symbol not in SUPPORTED_ELEMENTS:
+                return None, (
+                    f"Unsupported element: '{symbol}'. Supported: "
+                    f"{', '.join(sorted(SUPPORTED_ELEMENTS))}."
+                )
+            if atom.GetNumRadicalElectrons() > 0:
+                return None, (
+                    f"Radical electrons are not supported "
+                    f"(atom {atom.GetIdx()} {atom.GetSymbol()})."
+                )
+        return mol_h, (
+            "Disconnected fragments detected. Proceeding in permissive mode "
+            "(experimental for dimers/multimers)."
+        )
+
     try:
         # Validate and revalidate input SMILES first.
-        mol, _, validation_error = validate_smiles(smiles)
-        if validation_error is not None:
-            return None, None, None, validation_error
+        mol, validation_warning = _validate_smiles_with_disconnected_fallback(smiles)
+        if validation_warning is not None:
+            print(f"WARNING: {validation_warning}")
         if mol is None:
             return None, None, None, "SMILES validation failed."
 

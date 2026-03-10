@@ -106,17 +106,21 @@ If you prefer a fully conda-based setup (recommended for RDKit), you can install
 
 ### Data Setup
 
-The training and evaluation require the **ChEMBL3D** dataset. 
+Training and evaluation use the **ChEMBL3D** data releases below.
 
-**Available with this release [Download Here](https://drive.google.com/drive/folders/1PvSrep7_qIjTSslzXD3KUYEJ2Qr2lgDD?usp=sharing):**
-- Pre-trained LoQI model checkpoint (`loqi.ckpt`)
-- Processed ChEMBL3D lowest-energy conformers dataset (`chembl3d_stereo`)
+**Release 1: Full ChEMBL3D Quantum-Accurate conformer dataset**
+- URL: https://kilthub.cmu.edu/articles/dataset/_b_ChEMBL3D_Quantum-Accurate_3D_Conformers_for_ChEMBL_at_Scale_b_/31428449
+- DOI: https://doi.org/10.1184/R1/31428449
 
-**Coming soon:**
-- Full ChEMBL3D dataset (250M+ conformers) will be released in a separate repository
-- Complete dataset processing scripts and pipeline
+**Release 2: Processed dataset + LoQI checkpoints (diffusion + flow matching)**
+- URL: https://kilthub.cmu.edu/articles/dataset/LoQI_Scalable_Low-Energy_Molecular_Conformer_Generation_with_Quantum_Mechanical_Accuracy/31441570
+- DOI: https://doi.org/10.1184/R1/31441570
+- Includes:
+  - `loqi.ckpt`
+  - `loqi_flow.ckpt`
+  - `chembl3d_stereo/` processed dataset
 
-Place downloaded assets in the repository with this layout:
+For this repository, place downloaded assets with this layout:
 ```text
 LoQI/
   data/
@@ -196,13 +200,65 @@ python scripts/sample_conformers.py \
     --n_confs 100 \
     --batch_size 10 \
     --eval
+
+# Optional postprocessing: AIMNet2 optimization + iRMSD unique-set pruning
+python scripts/sample_conformers.py \
+    --config scripts/conf/loqi/loqi_flow.yaml \
+    --ckpt data/loqi_flow.ckpt \
+    --input "CC(=O)Oc1ccccc1C(=O)O" \
+    --output outputs/aspirin_opt_unique.sdf \
+    --n_confs 50 \
+    --batch_size 50 \
+    --postprocess optimization+irmsd \
+    --optimization_batch_size 64 \
+    --opt_fmax 0.05 \
+    --opt_max_nstep 250 \
+    --irmsd_rthr 0.125
 ```
+
+Recent sampling updates in `scripts/sample_conformers.py`:
+- input validation + SMILES revalidation (canonical roundtrip), with unsupported-element/radical checks
+- atom-aware dynamic batching for inference (`--atom-aware-batching`, `--target-molecule-size`, `--shuffle`)
+- optional hydrogen addition for SMILES inputs (`--add-hs` / `--no-add-hs`)
+- no RDKit conformer initialization for SMILES; zero-initialized coordinates are used
+- if input is SDF with conformers, existing 3D coordinates are used
+- optional postprocessing (`--postprocess none|optimization|optimization+irmsd`)
 
 On the tested setup (RTX 3090 + Ryzen 9 5950X), inference for a typical ChEMBL molecule takes approximately 0.1 seconds per conformer when processed within a batch. See **System and Hardware Requirements** above for VRAM guidance and OOM mitigation.
 
 Note: Make sure you define correct paths for dataset and AimNet2 model in `loqi.yaml`. The relative path of AimNet2 model is `src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt`.
 
 Sampling steps: `--n_steps` defaults to 25. Diffusion models were trained with 25 steps and are not expected to work well for other values. Flow-matching models can be run with different step counts.
+
+#### Performance Test (Fixed Molecule Sizes)
+
+Use `scripts/performance_test.py` to:
+- sample 1000 molecules each with atom counts 10, 25, 50, and 100 from `data/chembl3d_stereo/processed/train_h.pt`
+- select molecules deterministically (first `N` per size in dataset order)
+- export per-molecule SDF inputs
+- measure per-molecule generation and optimization times
+
+```bash
+conda run -n mega env PYTHONPATH=./src TORCH_COMPILE_DISABLE=1 \
+python scripts/performance_test.py \
+  --dataset_pt data/chembl3d_stereo/processed/train_h.pt \
+  --sizes 10,25,50,100 \
+  --n_per_size 100 \
+  --outdir outputs/performance_test \
+  --config scripts/conf/loqi/loqi.yaml \
+  --ckpt data/loqi.ckpt \
+  --n_confs 100 \
+  --generation_batch_size 1
+```
+
+By default, optimization settings are taken from the selected config
+(`evaluation.energy_metrics_args.batchsize` and `evaluation.energy_metrics_args.opt_params`).
+
+Outputs:
+- `outputs/performance_test/selected_manifest.csv` (selected molecules + per-molecule SDF path)
+- `outputs/performance_test/size_<N>/mol_*.sdf` (one input SDF per selected molecule)
+- `outputs/performance_test/size_<N>_selected.sdf` (combined SDF per size)
+- `outputs/performance_test/timings_per_molecule.csv` (generation/optimization timing per molecule)
 
 #### Available Configurations
 

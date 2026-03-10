@@ -1,6 +1,8 @@
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,41 +34,44 @@ from utils import (
 
 Chem.SetUseLegacyStereoPerception(True)
 
-st.set_page_config(page_title="LoQI Conformer Generator", page_icon="🧬", layout="wide")
-st.title("🧬 LoQI: Low-Energy QM Informed Conformer Generator")
-st.markdown("Generate and visualize low-energy molecular conformers with quantum mechanical accuracy")
+POSTPROCESS_NONE = "none"
+POSTPROCESS_OPT = "optimization"
+POSTPROCESS_OPT_IRMSD = "optimization + irmsd unique set selection"
 
-st.sidebar.header("Configuration")
-model_type = st.sidebar.selectbox("Model", ["Diffusion", "Flow Matching"], index=0)
-postprocess_mode = st.sidebar.selectbox(
-    "Postprocessing",
-    ["none", "optimization", "optimization + irmsd unique set selection"],
-    index=1,
-)
+EV_TO_KCAL_PER_MOL = 23.060547830619026
 
-if model_type == "Flow Matching":
-    n_steps = st.sidebar.slider("Sampling Steps", min_value=1, max_value=100, value=25)
-else:
-    n_steps = 25
-    st.sidebar.text_input("Sampling Steps (Diffusion)", value=str(n_steps), disabled=True)
 
-if postprocess_mode in ["optimization", "optimization + irmsd unique set selection"]:
-    st.sidebar.subheader("Optimization Parameters")
-    opt_fmax = st.sidebar.number_input("fmax", min_value=1e-5, max_value=1e-1, value=2e-3, format="%.5f")
-    opt_max_nstep = st.sidebar.number_input("max_nstep", min_value=100, max_value=20000, value=3000, step=100)
-else:
-    opt_fmax = 2e-3
-    opt_max_nstep = 3000
+@dataclass
+class SidebarConfig:
+    model_type: str
+    postprocess_mode: str
+    n_steps: int
+    opt_fmax: float
+    opt_max_nstep: int
+    irmsd_rthr: float
 
-if postprocess_mode == "optimization + irmsd unique set selection":
-    st.sidebar.subheader("iRMSD Parameters")
-    irmsd_rthr = st.sidebar.number_input("rthr (A)", min_value=0.01, max_value=2.0, value=0.125, format="%.3f")
-else:
-    irmsd_rthr = 0.125
 
-if st.sidebar.button("Clear Model Cache"):
-    st.cache_resource.clear()
-    st.sidebar.success("Cache cleared. The model will reload on next generation.")
+@dataclass
+class OptimizationResult:
+    success: bool
+    molecules: Optional[List[Chem.Mol]] = None
+    energies_kcal: Optional[np.ndarray] = None
+    metrics: Optional[Dict[str, Any]] = None
+    warning: Optional[str] = None
+    raw_error: Optional[str] = None
+
+
+def is_optimization_enabled(postprocess_mode: str) -> bool:
+    return postprocess_mode in {POSTPROCESS_OPT, POSTPROCESS_OPT_IRMSD}
+
+
+def is_irmsd_enabled(postprocess_mode: str) -> bool:
+    return postprocess_mode == POSTPROCESS_OPT_IRMSD
+
+
+def clone_cfg(cfg):
+    """Clone config to avoid mutating cached shared objects across Streamlit sessions."""
+    return OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
 
 
 @st.cache_resource
@@ -96,11 +101,12 @@ def load_model(selected_model_type):
     return model.to(device).eval(), cfg
 
 
-def evaluate_energies(molecules, cfg, fmax, max_nstep):
+def evaluate_energies(molecules, cfg, fmax, max_nstep) -> OptimizationResult:
     """Evaluate energies with AIMNet2 optimization."""
     aimnet_path = cfg.evaluation.energy_metrics_args.model_path
     if not os.path.exists(str(aimnet_path)):
-        return None, None, "AIMNet2 model not found"
+        msg = "AIMNet2 model not found"
+        return OptimizationResult(success=False, warning=msg, raw_error=msg)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     aimnet_batchsize = int(getattr(cfg.evaluation.energy_metrics_args, "batchsize", 100))
@@ -111,11 +117,137 @@ def evaluate_energies(molecules, cfg, fmax, max_nstep):
         opt_params={"fmax": float(fmax), "max_nstep": int(max_nstep)},
         device=device,
     )
-    results, _, opt_mols, opt_energies = energy_metrics(
-        molecules, reference_molecules=None, return_molecules=True
-    )
-    return opt_mols, opt_energies, results
 
+    try:
+        metrics, _, opt_mols, opt_energies = energy_metrics(
+            molecules, reference_molecules=None, return_molecules=True
+        )
+        energies_kcal = opt_energies.cpu().numpy() * EV_TO_KCAL_PER_MOL
+        return OptimizationResult(
+            success=True,
+            molecules=opt_mols,
+            energies_kcal=energies_kcal,
+            metrics=metrics,
+        )
+    except Exception as exc:
+        raw = str(exc)
+        if isinstance(exc, UnboundLocalError) and "converged" in raw:
+            msg = (
+                "Optimization failed in the AIMNet2 optimizer backend (internal convergence-state bug). "
+                "This is usually a downstream symptom after optimization did not finish cleanly for one or more "
+                "conformers."
+            )
+        else:
+            msg = "Optimization failed. Continuing without optimization."
+        return OptimizationResult(success=False, warning=msg, raw_error=raw)
+
+
+def render_2d_preview(smiles: str) -> None:
+    st.header("Molecule Visualization")
+    if not smiles:
+        return
+
+    try:
+        mol_2d = Chem.MolFromSmiles(smiles)
+        if mol_2d:
+            st.image(Draw.MolToImage(mol_2d, size=(400, 300)), caption="2D Structure")
+        else:
+            st.error("Invalid SMILES string")
+    except Exception as exc:
+        st.error(f"Error drawing 2D structure: {exc}")
+
+
+def render_3d_molecule(molecule: Chem.Mol, title: str) -> None:
+    st.subheader(title)
+    mol_block = Chem.MolToMolBlock(molecule)
+    viewer = py3Dmol.view(width=600, height=400)
+    viewer.addModel(mol_block, "mol")
+    viewer.setStyle({"stick": {}})
+    viewer.setBackgroundColor("white")
+    viewer.zoomTo()
+    components.html(viewer._make_html(), height=400, width=600, scrolling=False)
+
+
+def build_sidebar_config() -> SidebarConfig:
+    st.sidebar.header("Configuration")
+    model_type = st.sidebar.selectbox("Model", ["Diffusion", "Flow Matching"], index=0)
+    postprocess_mode = st.sidebar.selectbox(
+        "Postprocessing",
+        [POSTPROCESS_NONE, POSTPROCESS_OPT, POSTPROCESS_OPT_IRMSD],
+        index=1,
+    )
+
+    if model_type == "Flow Matching":
+        n_steps = st.sidebar.slider("Sampling Steps", min_value=1, max_value=100, value=25)
+    else:
+        n_steps = 25
+        st.sidebar.text_input("Sampling Steps (Diffusion)", value=str(n_steps), disabled=True)
+
+    if is_optimization_enabled(postprocess_mode):
+        st.sidebar.subheader("Optimization Parameters")
+        opt_fmax = st.sidebar.number_input("fmax", min_value=1e-5, max_value=1e-1, value=2e-3, format="%.5f")
+        opt_max_nstep = st.sidebar.number_input("max_nstep", min_value=100, max_value=20000, value=3000, step=100)
+    else:
+        opt_fmax = 2e-3
+        opt_max_nstep = 3000
+
+    if is_irmsd_enabled(postprocess_mode):
+        st.sidebar.subheader("iRMSD Parameters")
+        irmsd_rthr = st.sidebar.number_input("rthr (A)", min_value=0.01, max_value=2.0, value=0.125, format="%.3f")
+    else:
+        irmsd_rthr = 0.125
+
+    if st.sidebar.button("Clear Model Cache"):
+        st.cache_resource.clear()
+        st.sidebar.success("Cache cleared. The model will reload on next generation.")
+
+    return SidebarConfig(
+        model_type=model_type,
+        postprocess_mode=postprocess_mode,
+        n_steps=int(n_steps),
+        opt_fmax=float(opt_fmax),
+        opt_max_nstep=int(opt_max_nstep),
+        irmsd_rthr=float(irmsd_rthr),
+    )
+
+
+def build_conformer_rows(working_mols, energy_stats, energies_kcal, topology_results_display, stereo_results_display, display_idx):
+    rows = []
+    for i in range(len(working_mols)):
+        rel_energy = "N/A"
+        if energy_stats is not None:
+            rel_energy = f"{energies_kcal[i] - energy_stats['min_energy']:.2f}"
+
+        topology_ok = (
+            i < len(topology_results_display.get("topology_results", []))
+            and topology_results_display["topology_results"][i]
+        )
+        stereo_ok = True
+        if stereo_results_display.get("has_stereochemistry", False):
+            preserved = stereo_results_display.get("stereo_results", {}).get("preserved_stereo", [])
+            stereo_ok = i < len(preserved) and preserved[i]
+
+        rows.append(
+            {
+                "Conformer": i + 1,
+                "Relative Energy (kcal/mol)": rel_energy,
+                "Topology OK": "✓" if topology_ok else "✗",
+                "Stereochemistry OK": "✓" if stereo_ok else "✗"
+                if stereo_results_display.get("has_stereochemistry", False)
+                else "N/A",
+                "Is Displayed": i == display_idx,
+                "Is Best of Generated": energy_stats is not None and i == energy_stats["min_idx"],
+            }
+        )
+
+    return rows
+
+
+st.set_page_config(page_title="LoQI Conformer Generator", page_icon="🧬", layout="wide")
+st.title("🧬 LoQI: Low-Energy QM Informed Conformer Generator")
+st.markdown("Generate and visualize low-energy molecular conformers with quantum mechanical accuracy")
+
+sidebar_cfg = build_sidebar_config()
 
 left, right = st.columns([1, 2])
 with left:
@@ -129,33 +261,37 @@ with left:
     generate_button = st.button("Generate Conformers", type="primary")
 
 with right:
-    st.header("Molecule Visualization")
-    if smiles:
-        try:
-            mol_2d = Chem.MolFromSmiles(smiles)
-            if mol_2d:
-                st.image(Draw.MolToImage(mol_2d, size=(400, 300)), caption="2D Structure")
-            else:
-                st.error("Invalid SMILES string")
-        except Exception as e:
-            st.error(f"Error drawing 2D structure: {e}")
+    render_2d_preview(smiles)
 
 
 if generate_button and smiles:
-    with st.spinner(f"Loading {model_type} model..."):
-        model, cfg = load_model(model_type)
-        cfg = set_cfg_timesteps(cfg, n_steps)
+    mol_for_warning = Chem.MolFromSmiles(smiles)
+    if mol_for_warning is not None and len(Chem.GetMolFrags(mol_for_warning)) > 1:
+        st.warning(
+            "Disconnected fragments detected. Generation will run in permissive mode "
+            "(experimental for dimers/multimers)."
+        )
 
-    with st.spinner(f"Generating {n_confs} conformers ({n_steps} steps)..."):
+    with st.spinner(f"Loading {sidebar_cfg.model_type} model..."):
+        model, base_cfg = load_model(sidebar_cfg.model_type)
+        run_cfg = clone_cfg(base_cfg)
+        run_cfg = set_cfg_timesteps(run_cfg, sidebar_cfg.n_steps)
+
+    with st.spinner(f"Generating {n_confs} conformers ({sidebar_cfg.n_steps} steps)..."):
         generation_batchsize = int(
-            getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", n_confs))
+            getattr(run_cfg.data, "inference_batch_size", getattr(run_cfg.data, "batch_size", n_confs))
         )
         generated_mols, reference_mols, gen_time_per_structure_s, error = generate_conformers_batch(
-            smiles, model, cfg, n_confs, generation_batch_size=generation_batchsize
+            smiles, model, run_cfg, n_confs, generation_batch_size=generation_batchsize
         )
 
     if error:
-        st.error(f"Error generating conformers: {error}")
+        if "Disconnected fragments are not supported" in str(error):
+            st.warning(
+                "Disconnected fragments detected. Generation is experimental for dimers/multimers."
+            )
+        else:
+            st.error(f"Error generating conformers: {error}")
     elif generated_mols:
         st.success(f"Generated {len(generated_mols)} conformers successfully.")
         st.metric("Generation Time / Structure", f"{gen_time_per_structure_s:.4f} s")
@@ -165,25 +301,30 @@ if generate_button and smiles:
         metrics_mols = generated_mols
         metrics_refs = reference_mols
         energies_kcal = None
-        results = None
+        optimization_metrics = None
 
-        if postprocess_mode in ["optimization", "optimization + irmsd unique set selection"]:
+        if is_optimization_enabled(sidebar_cfg.postprocess_mode):
             with st.spinner("Running optimization..."):
-                opt_mols, opt_energies, results = evaluate_energies(
-                    working_mols, cfg, opt_fmax, opt_max_nstep
+                opt_result = evaluate_energies(
+                    working_mols, run_cfg, sidebar_cfg.opt_fmax, sidebar_cfg.opt_max_nstep
                 )
-            if isinstance(results, str):
-                st.error(results)
-                st.stop()
-            working_mols = opt_mols
-            metrics_mols = opt_mols
-            ev2kcalpermol = 23.060547830619026
-            energies_kcal = opt_energies.cpu().numpy() * ev2kcalpermol
 
-        if postprocess_mode == "optimization + irmsd unique set selection":
+            if not opt_result.success:
+                st.warning(opt_result.warning)
+                st.info("Continuing with generated conformers without optimization.")
+                if opt_result.raw_error:
+                    with st.expander("Optimization debug details"):
+                        st.code(opt_result.raw_error)
+            else:
+                working_mols = opt_result.molecules
+                metrics_mols = opt_result.molecules
+                energies_kcal = opt_result.energies_kcal
+                optimization_metrics = opt_result.metrics
+
+        if is_irmsd_enabled(sidebar_cfg.postprocess_mode):
             with st.spinner("Running iRMSD unique-set selection..."):
                 unique_mols, selected_indices, irmsd_error = select_unique_with_irmsd(
-                    working_mols, rthr=irmsd_rthr
+                    working_mols, rthr=sidebar_cfg.irmsd_rthr
                 )
             if irmsd_error:
                 st.error(irmsd_error)
@@ -195,10 +336,8 @@ if generate_button and smiles:
             st.info(f"Unique conformers after iRMSD pruning: {len(working_mols)}")
 
         with st.spinner("Checking topology and stereochemistry preservation..."):
-            # Global metrics are computed on initially generated set (before iRMSD pruning).
             topology_results_metrics = check_topology_preservation(metrics_mols)
             stereo_results_metrics = check_stereochemistry_preservation(metrics_mols, metrics_refs)
-            # Row-level flags are computed on currently displayed set.
             topology_results_display = check_topology_preservation(working_mols)
             stereo_results_display = check_stereochemistry_preservation(working_mols, working_refs)
 
@@ -219,14 +358,7 @@ if generate_button and smiles:
 
         vis_col, stats_col = st.columns([2, 1])
         with vis_col:
-            st.subheader(display_type)
-            mol_block = Chem.MolToMolBlock(display_mol)
-            viewer = py3Dmol.view(width=600, height=400)
-            viewer.addModel(mol_block, "mol")
-            viewer.setStyle({"stick": {}})
-            viewer.setBackgroundColor("white")
-            viewer.zoomTo()
-            components.html(viewer._make_html(), height=400, width=600, scrolling=False)
+            render_3d_molecule(display_mol, display_type)
 
         with stats_col:
             st.subheader("Analysis")
@@ -236,14 +368,14 @@ if generate_button and smiles:
             else:
                 st.metric("Energies", "Not computed")
 
-            if isinstance(results, dict):
-                if "opt_total_time" in results:
-                    avg_opt_time = float(results["opt_total_time"]) / max(len(generated_mols), 1)
+            if isinstance(optimization_metrics, dict):
+                if "opt_total_time" in optimization_metrics:
+                    avg_opt_time = float(optimization_metrics["opt_total_time"]) / max(len(generated_mols), 1)
                     st.metric("Avg Optimization Time / Structure", f"{avg_opt_time:.4f} s")
-                if "opt_avg_energy_drop" in results:
-                    st.metric("Avg Energy Drop", f"{results['opt_avg_energy_drop']:.2f} kcal/mol")
-                if "opt_converged" in results:
-                    st.metric("Optimization Success", f"{results['opt_converged'] * 100:.1f}%")
+                if "opt_avg_energy_drop" in optimization_metrics:
+                    st.metric("Avg Energy Drop", f"{optimization_metrics['opt_avg_energy_drop']:.2f} kcal/mol")
+                if "opt_converged" in optimization_metrics:
+                    st.metric("Optimization Success", f"{optimization_metrics['opt_converged'] * 100:.1f}%")
 
             st.metric("Topology Preserved", f"{topology_results_metrics['topology_preserved_percentage']:.1f}%")
             if stereo_results_metrics["has_stereochemistry"]:
@@ -252,31 +384,14 @@ if generate_button and smiles:
                 st.metric("Stereochemistry", "No R/S or E/Z centers")
 
         st.subheader("All Conformers")
-        rows = []
-        for i in range(len(working_mols)):
-            rel_energy = "N/A"
-            if energy_stats is not None:
-                rel_energy = f"{energies_kcal[i] - energy_stats['min_energy']:.2f}"
-            topology_ok = (
-                i < len(topology_results_display.get("topology_results", []))
-                and topology_results_display["topology_results"][i]
-            )
-            stereo_ok = True
-            if stereo_results_display.get("has_stereochemistry", False):
-                preserved = stereo_results_display.get("stereo_results", {}).get("preserved_stereo", [])
-                stereo_ok = i < len(preserved) and preserved[i]
-            rows.append(
-                {
-                    "Conformer": i + 1,
-                    "Relative Energy (kcal/mol)": rel_energy,
-                    "Topology OK": "✓" if topology_ok else "✗",
-                    "Stereochemistry OK": "✓" if stereo_ok else "✗"
-                    if stereo_results_display.get("has_stereochemistry", False)
-                    else "N/A",
-                    "Is Displayed": i == display_idx,
-                    "Is Best of Generated": energy_stats is not None and i == energy_stats["min_idx"],
-                }
-            )
+        rows = build_conformer_rows(
+            working_mols,
+            energy_stats,
+            energies_kcal,
+            topology_results_display,
+            stereo_results_display,
+            display_idx,
+        )
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
         st.subheader("Download Results")
