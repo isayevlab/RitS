@@ -10,7 +10,10 @@ from typing import Tuple, Optional
 from torch_geometric.typing import Adj, OptTensor
 from torch_scatter import scatter
 
-disable_compile = torch.cuda.get_device_name(0).find('AMD') >= 0
+if torch.cuda.is_available():
+    disable_compile = torch.cuda.get_device_name(0).find('AMD') >= 0
+else:
+    disable_compile = False
 
 @torch.compiler.disable
 def uncompilable_dropout(x, p, training):
@@ -665,7 +668,6 @@ class DGTDiffusion(nn.Module):
             pred_pos = remove_mean(pred_pos, data.batch)
         return pred_pos
     
-
 
 
 

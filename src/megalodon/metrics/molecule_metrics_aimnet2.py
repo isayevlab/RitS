@@ -422,7 +422,14 @@ class MoleculeAIMNet2Metrics:
         energy_drop = (energy - opt_energy)[topology_mask] * ev2kcalpermol
         metrics.update({
             "opt_converged": opt_converged.float().mean().item(),
-            "opt_steps": opt_n_steps[converged].float().mean().item(),
+            # opt_converged stores 0/1 flags, not positional indices.
+            # Using the last local `converged` tensor here can trigger out-of-bounds
+            # indexing for single-molecule cases (e.g., value 1 with size 1).
+            "opt_steps": (
+                opt_n_steps[opt_converged.bool()].float().mean().item()
+                if opt_converged.bool().any()
+                else 0.0
+            ),
             "preserved_topology": topology_mask.float().mean().item(),
             "opt_avg_energy_drop": energy_drop.mean().item(),
             "opt_median_energy_drop": torch.median(energy_drop).item(),

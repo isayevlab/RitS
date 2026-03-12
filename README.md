@@ -41,7 +41,28 @@
 
 ## Setup
 
-This setup has been tested on Ubuntu 22.04, but can be used across multiple platforms as PyTorch, Pytorch Geometric, and RdKit are widely supported. Installation will usually take up to 20 minutes. 
+Installation will usually take up to 20 minutes.
+
+### System and Hardware Requirements
+
+- OS tested by authors:
+  - Ubuntu 24.04 LTS (latest stable Ubuntu LTS at time of writing)
+- Other platforms:
+  - Expected to work, but if installation is not out-of-the-box, use the PyTorch Geometric installation guide for your exact Python/PyTorch/CUDA combination:
+    https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+- Tested inference hardware:
+  - GPU: NVIDIA RTX 3090 (24 GB VRAM)
+  - CPU: AMD Ryzen 9 5950X
+- Recommended GPU memory:
+  - 16-24 GB VRAM for comfortable inference/evaluation with larger molecules and higher batch sizes
+- Minimum practical GPU memory:
+  - 8 GB VRAM can run inference, but requires reduced batch sizes
+- CPU-only:
+  - Possible, but not recommended and not systematically studied by the authors
+
+OOM mitigation for larger molecules:
+- reduce inference batch size (`--batch_size` in sampling, or `data.inference_batch_size` in config)
+- if using evaluation/optimization, also reduce optimization batch size (`evaluation.energy_metrics_args.batchsize`)
 
 ### Prerequisites
 
@@ -64,6 +85,8 @@ conda activate loqi
 pip install -r requirements.txt
 pip install -e .
 ```
+
+If you prefer a fully conda-based setup (recommended for RDKit), you can install RDKit via conda-forge before running `pip install -r requirements.txt`.
 
 ### Data Setup
 

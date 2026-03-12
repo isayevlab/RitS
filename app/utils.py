@@ -3,11 +3,12 @@ Utility functions for LoQI conformer generation app.
 """
 
 import sys
+import time
 import torch
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
-from torch_geometric.data import Data, Batch
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader
 
 # Add src to path for imports
 sys.path.append('/home/fnikitin/LoQI/src')
@@ -15,37 +16,11 @@ sys.path.append('/home/fnikitin/LoQI/src')
 from megalodon.metrics.conformer_evaluation_callback import (
     write_coords_to_mol, convert_coords_to_np
 )
+from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
+from megalodon.inference.validation import SUPPORTED_ELEMENTS, validate_smiles
 from megalodon.metrics.molecule_evaluation_callback import full_atom_encoder
 from megalodon.metrics.aimnet2.check_topology import check_topology
 from megalodon.metrics.preserved_stereo import get_stereochemistry_descriptor
-
-
-def smiles_to_mol(smiles, add_hs=True, embed_3d=True):
-    """
-    Convert SMILES string to RDKit molecule with optional 3D embedding.
-    
-    Args:
-        smiles (str): SMILES string
-        add_hs (bool): Whether to add hydrogens
-        embed_3d (bool): Whether to embed 3D coordinates
-        
-    Returns:
-        Chem.Mol or None: RDKit molecule object
-    """
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-    
-    if add_hs:
-        mol = Chem.AddHs(mol)
-    
-    if embed_3d:
-        try:
-            AllChem.EmbedMolecule(mol, randomSeed=42)
-        except:
-            return None
-    
-    return mol
 
 
 def add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index=None, edge_attr=None, from_3D=True):
@@ -152,7 +127,16 @@ def mol_to_torch_geometric_simple(mol, smiles):
     )
 
 
-def generate_conformers_batch(smiles, model, cfg, n_confs=10):
+def generate_conformers_batch(
+        smiles,
+        model,
+        cfg,
+        n_confs=10,
+        generation_batch_size=None,
+        atom_aware_batching=None,
+        shuffle=None,
+        target_molecule_size=None,
+):
     """
     Generate multiple conformers for a given SMILES using the LoQI model.
     
@@ -163,14 +147,49 @@ def generate_conformers_batch(smiles, model, cfg, n_confs=10):
         n_confs (int): Number of conformers to generate
         
     Returns:
-        tuple: (list of generated molecules, list of reference molecules, error message or None)
+        tuple: (generated molecules, reference molecules, seconds per structure, error message)
     """
-    try:
-        # Create base molecule
-        mol = smiles_to_mol(smiles, add_hs=True, embed_3d=True)
+    def _validate_smiles_with_disconnected_fallback(input_smiles):
+        mol_valid, _, validation_error = validate_smiles(input_smiles)
+        if validation_error is None:
+            return mol_valid, None
+        if "Disconnected fragments are not supported" not in str(validation_error):
+            return None, validation_error
+
+        # Fallback validation path for disconnected systems (e.g., dimers).
+        mol = Chem.MolFromSmiles(str(input_smiles).strip())
         if mol is None:
-            return None, None, "Invalid SMILES string or failed to embed 3D coordinates"
-        
+            return None, f"RDKit failed to parse SMILES: {input_smiles!r}."
+        canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+        mol_roundtrip = Chem.MolFromSmiles(canonical)
+        if mol_roundtrip is None:
+            return None, f"Revalidation failed after canonicalization: {canonical!r}."
+        mol_h = Chem.AddHs(mol_roundtrip)
+        for atom in mol_h.GetAtoms():
+            symbol = atom.GetSymbol()
+            if symbol not in SUPPORTED_ELEMENTS:
+                return None, (
+                    f"Unsupported element: '{symbol}'. Supported: "
+                    f"{', '.join(sorted(SUPPORTED_ELEMENTS))}."
+                )
+            if atom.GetNumRadicalElectrons() > 0:
+                return None, (
+                    f"Radical electrons are not supported "
+                    f"(atom {atom.GetIdx()} {atom.GetSymbol()})."
+                )
+        return mol_h, (
+            "Disconnected fragments detected. Proceeding in permissive mode "
+            "(experimental for dimers/multimers)."
+        )
+
+    try:
+        # Validate and revalidate input SMILES first.
+        mol, validation_warning = _validate_smiles_with_disconnected_fallback(smiles)
+        if validation_warning is not None:
+            print(f"WARNING: {validation_warning}")
+        if mol is None:
+            return None, None, None, "SMILES validation failed."
+
         # Create data list for batch processing
         data_list = []
         reference_mols = []
@@ -178,14 +197,40 @@ def generate_conformers_batch(smiles, model, cfg, n_confs=10):
             data = mol_to_torch_geometric_simple(mol, smiles)
             data_list.append(data)
             reference_mols.append(Chem.Mol(mol))  # Copy of original molecule for reference
-        
-        # Create batch and move to device
-        batch = Batch.from_data_list(data_list).to(model.device)
-        
-        # Generate conformers
+
+        if generation_batch_size is None:
+            generation_batch_size = int(
+                getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", n_confs))
+            )
+        generation_batch_size = max(1, int(generation_batch_size))
+        if atom_aware_batching is None:
+            atom_aware_batching = True
+        if shuffle is None:
+            shuffle = False
+        if target_molecule_size is None:
+            target_molecule_size = 50
+
+        # Generate conformers in batches
+        timesteps = getattr(cfg.interpolant, "timesteps", 25)
+        t0 = time.perf_counter()
+        coords_list = []
+        if atom_aware_batching:
+            sampler = AdaptiveBatchSampler(
+                data_list,
+                reference_batch_size=generation_batch_size,
+                shuffle=shuffle,
+                reference_size=target_molecule_size,
+            )
+            loader = DataLoader(data_list, batch_sampler=sampler)
+        else:
+            loader = DataLoader(data_list, batch_size=generation_batch_size, shuffle=shuffle)
         with torch.no_grad():
-            sample = model.sample(batch=batch, timesteps=cfg.interpolant.timesteps, pre_format=True)
-            coords_list = convert_coords_to_np(sample)
+            for batch in loader:
+                batch = batch.to(model.device)
+                sample = model.sample(batch=batch, timesteps=timesteps, pre_format=True)
+                coords_list.extend(convert_coords_to_np(sample))
+        elapsed_s = time.perf_counter() - t0
+        per_structure_s = elapsed_s / max(len(coords_list), 1)
         
         # Create molecules with generated coordinates
         generated_mols = []
@@ -193,10 +238,59 @@ def generate_conformers_batch(smiles, model, cfg, n_confs=10):
             new_mol = write_coords_to_mol(mol, coords)
             generated_mols.append(new_mol)
         
-        return generated_mols, reference_mols, None
+        return generated_mols, reference_mols, per_structure_s, None
         
     except Exception as e:
-        return None, None, str(e)
+        return None, None, None, str(e)
+
+
+def set_cfg_timesteps(cfg, timesteps):
+    """Set timesteps for sampling without mutating caller-owned config unexpectedly."""
+    cfg.interpolant.timesteps = int(timesteps)
+    if "evaluation" in cfg and "timesteps" in cfg.evaluation:
+        cfg.evaluation.timesteps = int(timesteps)
+    return cfg
+
+
+def select_unique_with_irmsd(molecules, rthr=0.125):
+    """
+    Select iRMSD-unique subset from molecules.
+
+    Returns:
+        tuple: (unique_molecules, selected_indices, error_message)
+    """
+    try:
+        from irmsd import sorter_irmsd_rdkit  # type: ignore
+    except Exception:
+        return None, None, (
+            "iRMSD is not installed. Install with: pip install irmsd"
+        )
+
+    try:
+        # iinversion=2 disables inversion.
+        groups, _ = sorter_irmsd_rdkit(
+            molecules, rthr=float(rthr), iinversion=2, allcanon=True, printlvl=0
+        )
+        groups = np.asarray(groups).reshape(-1)
+        if groups.shape[0] != len(molecules):
+            return None, None, (
+                f"iRMSD returned unexpected group shape {groups.shape}; expected ({len(molecules)},)."
+            )
+
+        selected_indices = []
+        seen = set()
+        for idx, gid in enumerate(groups.tolist()):
+            if gid not in seen:
+                seen.add(gid)
+                selected_indices.append(idx)
+
+        if not selected_indices:
+            return None, None, "iRMSD did not produce any unique representatives."
+
+        unique_mols = [molecules[i] for i in selected_indices]
+        return unique_mols, selected_indices, None
+    except Exception as e:
+        return None, None, f"iRMSD pruning failed: {e}"
 
 
 def create_sdf_content(molecules, energies_kcal=None, min_energy=None):
@@ -389,17 +483,14 @@ def check_stereochemistry_preservation(generated_molecules, reference_molecules)
         Chem.rdmolops.AssignStereochemistryFrom3D(mol_copy)
         
         # Get descriptors (same as StereoMetrics)
-        sr, inv_sr, ez = get_stereochemistry_descriptor(mol_copy)
+        sr, _, ez = get_stereochemistry_descriptor(mol_copy)
         ref_sr, _, ref_ez = get_stereochemistry_descriptor(ref_copy)
         
         # Check if molecule has stereochemistry
         if ref_sr or ref_ez:
             has_stereo = True
             
-            # For distance-matrix based models, we should check both original and inverted molecule stereochemistry
-            # and accept whichever gives better preservation (especially important for single stereocenters)
-            
-            # Option 1: Compare original molecule with reference
+            # Compare only generated stereochemistry as-is (no inversion fallback).
             rs_correct_orig = True
             if ref_sr:
                 rs_correct_orig = (sr == ref_sr)
@@ -407,20 +498,7 @@ def check_stereochemistry_preservation(generated_molecules, reference_molecules)
             if ref_ez:
                 ez_correct_orig = (ez == ref_ez)
             preservation_orig = rs_correct_orig and ez_correct_orig
-            
-            # Option 2: Compare inverted molecule stereochemistry with reference
-            # Invert the generated molecule's R/S descriptors (R↔S)
-            sr_inv = inv_sr  # This is the inverted R/S descriptor from get_stereochemistry_descriptor
-            rs_correct_inv = True
-            if ref_sr:
-                rs_correct_inv = (sr_inv == ref_sr)
-            ez_correct_inv = True
-            if ref_ez:
-                ez_correct_inv = (ez == ref_ez)  # E/Z doesn't get inverted
-            preservation_inv = rs_correct_inv and ez_correct_inv
-            
-            # Accept the better preservation (for single stereocenter, one should be 100%)
-            preserved_stereo.append(preservation_orig or preservation_inv)
+            preserved_stereo.append(preservation_orig)
         else:
             # No stereochemistry to preserve
             preserved_stereo.append(True)

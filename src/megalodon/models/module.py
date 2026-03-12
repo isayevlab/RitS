@@ -263,7 +263,6 @@ class Graph3DInterpolantModel(pl.LightningModule):
                         batch.batch, batch[f"{interp_param.variable_name}"], time
                     )
                 # For flow matching methods that predict velocity, store the velocity target
-                # GoFlow always predicts velocity; continuous_flow_matching can predict velocity or data
                 prediction_type = interp_param.get('prediction_type', 'data')
                 if ((interp_param.interpolant_type == 'continuous_flow_matching' and
                      prediction_type == 'velocity')):
@@ -483,8 +482,14 @@ class Graph3DInterpolantModel(pl.LightningModule):
         """
         Generates num_samples. Can supply a batch for inital starting points for conditional sampling for any interpolants set to None.
         """
-        # Get return_step_output from config (default False for backwards compatibility)
-        return_step_output = getattr(self.sampling_params, 'return_step_output', False)
+        # Prefer explicit config; otherwise auto-enable for velocity prediction
+        return_step_output = getattr(self.sampling_params, 'return_step_output', None)
+        if return_step_output is None:
+            return_step_output = any(
+                getattr(p, 'prediction_type', 'data') == 'velocity'
+                for p in self.interpolant_params.variables
+                if getattr(p, 'interpolant_type', '') == 'continuous_flow_matching'
+            )
 
         assert num_samples is not None or batch is not None
 
