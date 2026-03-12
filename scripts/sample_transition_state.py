@@ -543,8 +543,25 @@ def main():
     parser.add_argument(
         "--add_stereo", action="store_true", help="Add stereo bond information (E/Z and chirality)"
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to run inference on: auto, cpu, cuda, or cuda:<index>",
+    )
 
     args = parser.parse_args()
+
+    if args.device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA device requested but CUDA is not available. "
+                "Use --device cpu or run on a GPU-enabled environment."
+            )
+    print(f"Using device: {device}")
 
     # Determine input type and create data
     use_xyz_input = args.reactant_xyz and args.product_xyz
@@ -574,7 +591,7 @@ def main():
         batch_preprocessor=batch_preprocessor,
         strict=True,
     )
-    model = model.to("cuda").eval()
+    model = model.to(device).eval()
 
     # Process reactions based on input type
     all_data_list = []
@@ -635,7 +652,7 @@ def main():
     timesteps = args.num_steps if args.num_steps is not None else cfg.interpolant.timesteps
 
     for batch in tqdm(loader, desc="Sampling transition states"):
-        batch = batch.to(model.device)
+        batch = batch.to(device)
 
         with torch.no_grad():
             sample = model.sample(
