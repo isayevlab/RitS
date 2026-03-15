@@ -1,32 +1,109 @@
 """
-Utility functions for LoQI conformer generation app.
+Utility functions for RitS transition-state sampling app.
 """
 
 import sys
-import time
-import torch
+import tempfile
+import subprocess
+from copy import deepcopy
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
+import torch
 from rdkit import Chem
+from rdkit.Chem import rdDepictor, rdChemReactions
+from rdkit.Chem.Draw import rdMolDraw2D
+from rdkit.Chem.rdchem import BondType as BT
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
-# Add src to path for imports
-sys.path.append('/home/fnikitin/LoQI/src')
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-from megalodon.metrics.conformer_evaluation_callback import (
-    write_coords_to_mol, convert_coords_to_np
-)
-from megalodon.data.adaptive_dataloader import AdaptiveBatchSampler
-from megalodon.inference.validation import SUPPORTED_ELEMENTS, validate_smiles
-from megalodon.metrics.molecule_evaluation_callback import full_atom_encoder
-from megalodon.metrics.aimnet2.check_topology import check_topology
-from megalodon.metrics.preserved_stereo import get_stereochemistry_descriptor
+from omegaconf import OmegaConf
+from megalodon.models.module import Graph3DInterpolantModel
+from megalodon.data.ts_batch_preprocessor import TsBatchPreProcessor
+from megalodon.metrics.ts_evaluation_callback import convert_coords_to_np
 
+Chem.SetUseLegacyStereoPerception(True)
 
-def add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index=None, edge_attr=None, from_3D=True):
-    """Add stereochemistry edges to the molecular graph."""
+BOND_TYPES = {BT.SINGLE: 1, BT.DOUBLE: 2, BT.TRIPLE: 3, BT.AROMATIC: 4}
+NUM_BOND_TYPES = 9
+
+CONFIG_PATH = ROOT / "scripts" / "conf" / "rits.yaml"
+CKPT_PATH = ROOT / "data" / "rits.ckpt"
+
+EXAMPLE_REACTIONS = {
+    "Amide hydrolysis": (
+        "[C:1]([N:2]([C:4]([C:3]([H:10])([H:11])[H:12])=[O:13])[H:8])([H:5])([H:6])[H:7]"
+        ".[H:9][O:14][H:15]"
+        ">>"
+        "[C:1]([N:2]([H:8])[H:9])([H:5])([H:6])[H:7]"
+        ".[C:3]([C:4](=[O:13])[O:14][H:15])([H:10])([H:11])[H:12]"
+    ),
+    "Diels-Alder": (
+        "[C:12](#[C:13][C@@:14]1([H:29])[C:15]([H:30])([H:31])[N:16]([H:32])"
+        "[C:17]([H:33])([H:34])[C:18]1([H:35])[H:36])[H:28]"
+        ".[C:1](=[C:2](/[C:3](=[C:4](\\[C:5]([C:6](=[O:7])[O:8][C:9](=[O:10])"
+        "[N:11]([H:26])[H:27])([H:24])[H:25])[H:23])[H:22])[H:21])([H:19])[H:20]"
+        ">>"
+        "[C:1]1([H:19])([H:20])[C:2]([H:21])=[C:3]([H:22])[C@:4]([C:5]([C:6](=[O:7])"
+        "[O:8][C:9](=[O:10])[N:11]([H:26])[H:27])([H:24])[H:25])([H:23])"
+        "[C:12]([H:28])=[C:13]1[C@@:14]1([H:29])[C:15]([H:30])([H:31])"
+        "[N:16]([H:32])[C:17]([H:33])([H:34])[C:18]1([H:35])[H:36]"
+    ),
+    "Click chemistry (CuAAC)": (
+        "[C:1]([C:2](=[O:3])[O:4][C:5]([C:6]([C:7]([N:8]=[N+:9]=[N-:10])"
+        "([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])([H:11])([H:12])[H:13]"
+        ".[O:20]([C:21]([C:22]#[C:23][H:27])([H:25])[H:26])[H:24]"
+        ">>"
+        "[C@:1]([C:2](=[O:3])[O:4][C@@:5]([C@@:6]([C@@:7]([N:8]1:[N:9]:[N:10]:"
+        "[C:22]([C@:21]([O:20][H:24])([H:25])[H:26]):[C:23]:1[H:27])"
+        "([H:18])[H:19])([H:16])[H:17])([H:14])[H:15])([H:11])([H:12])[H:13]"
+    ),
+    "Epoxidation": (
+        "[H:11][O:19][C:20](=[C:22]([H:21])[H:23])[C:24]([H:25])([H:26])[H:27]"
+        ".[O:1]([C:2](=[O:3])[C:4]([c:5]1[c:6]([H:14])[c:7]([H:15])[c:8]([H:16])"
+        "[c:9]([H:17])[c:10]1[H:18])([H:12])[H:13])[H:28]"
+        ">>"
+        "[O:19]1[C:20]([C:24]([H:25])([H:26])[H:27])([H:28])[C:22]1([H:21])[H:23]"
+        ".[O:1]=[C:2]([O:3][H:11])[C:4]([c:5]1[c:6]([H:14])[c:7]([H:15])"
+        "[c:8]([H:16])[c:9]([H:17])[c:10]1[H:18])([H:12])[H:13]"
+    ),
+    "Ester exchange": (
+        "[C:1]([C:2]([O:3][C:4](=[O:5])[C:6]([C:7]([C:8]([H:17])([H:18])[H:19])"
+        "=[O:9])([H:15])[H:16])([H:13])[H:14])([H:10])([H:11])[H:12]"
+        ".[O:20]([C:23]([H:21])([H:22])[H:24])[H:25]"
+        ">>"
+        "[C:1]([C:2]([O:3][C:4](=[O:5])[C:6]([H:15])([H:16])[H:25])([H:13])"
+        "[H:14])([H:10])([H:11])[H:12]"
+        ".[C:7]([C:8]([H:17])([H:18])[H:19])(=[O:9])[O:20][C:23]([H:21])([H:22])[H:24]"
+    ),
+    "Carbamate formation": (
+        "[C:11]([H:12])([H:13])([H:14])[N:15]=[C:16]=[O:17]"
+        ".[C:1](=[C:2]([C:3]([O:4][H:5])([H:9])[H:10])[H:8])([H:6])[H:7]"
+        ">>"
+        "[C:1](=[C:2](/[C@@:3]([O:4][C:16]([N:15]([H:5])[C@@:11]([H:12])([H:13])"
+        "[H:14])=[O:17])([H:9])[H:10])[H:8])(\\[H:6])[H:7]"
+    ),
+    "E2 elimination (chlorostyrene)": (
+        "[C:1]1([C:7]([C:8]([Cl:9])([Cl:10])[H:18])([H:16])[H:17])=[C:2]([H:11])"
+        "[C:3]([H:12])=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15]"
+        ">>"
+        "[C:1]1([C:7](=[C:8]([Cl:9])[H:18])[H:16])=[C:2]([H:11])[C:3]([H:12])"
+        "=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15].[Cl:10][H:17]"
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Stereo bond helpers (from sample_transition_state.py)
+# ---------------------------------------------------------------------------
+
+def add_stereo_bonds(mol, chi_bonds, ez_bonds, bmat, from_3D=False):
+    """Add stereo bond information to adjacency matrix."""
     result = []
-    if from_3D and mol.GetNumConformers() > 0:
+    if from_3D:
         Chem.AssignStereochemistryFrom3D(mol, replaceExistingTags=True)
     else:
         Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
@@ -37,482 +114,483 @@ def add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index=None, edge_attr=None, 
             idx_3, idx_4 = bond.GetStereoAtoms()
             atom_1, atom_2 = bond.GetBeginAtom(), bond.GetEndAtom()
             idx_1, idx_2 = atom_1.GetIdx(), atom_2.GetIdx()
-
-            idx_5 = [nbr.GetIdx() for nbr in atom_1.GetNeighbors() if nbr.GetIdx() not in {idx_2, idx_3}]
-            idx_6 = [nbr.GetIdx() for nbr in atom_2.GetNeighbors() if nbr.GetIdx() not in {idx_1, idx_4}]
-
-            inv_stereo = Chem.BondStereo.STEREOE if stereo == Chem.BondStereo.STEREOZ else Chem.BondStereo.STEREOZ
+            idx_5 = [n.GetIdx() for n in atom_1.GetNeighbors() if n.GetIdx() not in {idx_2, idx_3}]
+            idx_6 = [n.GetIdx() for n in atom_2.GetNeighbors() if n.GetIdx() not in {idx_1, idx_4}]
+            inv_stereo = (
+                Chem.BondStereo.STEREOE if stereo == Chem.BondStereo.STEREOZ else Chem.BondStereo.STEREOZ
+            )
             result.extend([(idx_3, idx_4, ez_bonds[stereo]), (idx_4, idx_3, ez_bonds[stereo])])
-
             if idx_5:
-                result.extend([(idx_5[0], idx_4, ez_bonds[inv_stereo]), (idx_4, idx_5[0], ez_bonds[inv_stereo])])
+                result.extend([(idx_5[0], idx_4, ez_bonds[inv_stereo]),
+                               (idx_4, idx_5[0], ez_bonds[inv_stereo])])
             if idx_6:
-                result.extend([(idx_3, idx_6[0], ez_bonds[inv_stereo]), (idx_6[0], idx_3, ez_bonds[inv_stereo])])
+                result.extend([(idx_3, idx_6[0], ez_bonds[inv_stereo]),
+                               (idx_6[0], idx_3, ez_bonds[inv_stereo])])
             if idx_5 and idx_6:
-                result.extend([(idx_5[0], idx_6[0], ez_bonds[stereo]), (idx_6[0], idx_5[0], ez_bonds[stereo])])
+                result.extend([(idx_5[0], idx_6[0], ez_bonds[stereo]),
+                               (idx_6[0], idx_5[0], ez_bonds[stereo])])
 
-        if bond.GetBeginAtom().HasProp('_CIPCode'):
-            idx = bond.GetBeginAtom().GetIdx()
-            chirality = bond.GetBeginAtom().GetProp('_CIPCode')
+        if bond.GetBeginAtom().HasProp("_CIPCode"):
+            chirality = bond.GetBeginAtom().GetProp("_CIPCode")
             neighbors = bond.GetBeginAtom().GetNeighbors()
             if all(n.HasProp("_CIPRank") for n in neighbors):
-                sorted_neighbors = sorted(neighbors, key=lambda x: int(x.GetProp("_CIPRank")), reverse=True)
-                sorted_neighbors = [a.GetIdx() for a in sorted_neighbors]
-                a, b, c = sorted_neighbors[:3] if chirality == "R" else sorted_neighbors[:3][::-1]
-                d = sorted_neighbors[-1]
+                sorted_nbrs = sorted(neighbors, key=lambda x: int(x.GetProp("_CIPRank")), reverse=True)
+                sorted_nbrs = [a.GetIdx() for a in sorted_nbrs]
+                a_idx, b_idx, c_idx = sorted_nbrs[:3] if chirality == "R" else sorted_nbrs[:3][::-1]
+                d_idx = sorted_nbrs[-1]
                 result.extend([
-                    (a, d, chi_bonds[0]), (b, d, chi_bonds[0]), (c, d, chi_bonds[0]),
-                    (d, a, chi_bonds[0]), (d, b, chi_bonds[0]), (d, c, chi_bonds[0]),
-                    (b, a, chi_bonds[1]), (c, b, chi_bonds[1]), (a, c, chi_bonds[1])
+                    (a_idx, d_idx, chi_bonds[0]), (b_idx, d_idx, chi_bonds[0]),
+                    (c_idx, d_idx, chi_bonds[0]), (d_idx, a_idx, chi_bonds[0]),
+                    (d_idx, b_idx, chi_bonds[0]), (d_idx, c_idx, chi_bonds[0]),
+                    (b_idx, a_idx, chi_bonds[1]), (c_idx, b_idx, chi_bonds[1]),
+                    (a_idx, c_idx, chi_bonds[1]),
                 ])
 
-    if not result:
-        return edge_index, edge_attr
-    new_edge_index = torch.tensor([[i, j] for i, j, _ in result], dtype=torch.long).T
-    new_edge_attr = torch.tensor([b for _, _, b in result], dtype=torch.uint8)
-
-    if edge_index is None:
-        return new_edge_index, new_edge_attr
-    edge_index = torch.cat([edge_index, new_edge_index], dim=1)
-    edge_attr = torch.cat([edge_attr, new_edge_attr])
-    return edge_index, edge_attr
+    for i, j, v in result:
+        if bmat[i, j] == 0:
+            bmat[i, j] = v
+    return bmat
 
 
-def mol_to_torch_geometric_simple(mol, smiles):
+# ---------------------------------------------------------------------------
+# Reaction SMARTS → PyG Data (from sample_transition_state.py)
+# ---------------------------------------------------------------------------
+
+def process_reaction_smarts(r_smarts, p_smarts, charge=0, add_stereo=True):
+    """Parse mapped reactant/product SMILES into a PyG Data object.
+    Always kekulizes (model trained on kekulized bonds).
     """
-    Convert RDKit molecule to PyTorch Geometric Data object with stereochemistry edges.
-    
-    Args:
-        mol (Chem.Mol): RDKit molecule
-        smiles (str): SMILES string
-        
-    Returns:
-        Data: PyTorch Geometric Data object
-    """
-    # Sanitize molecule
-    Chem.SanitizeMol(mol)
-    Chem.Kekulize(mol, clearAromaticFlags=True)
-    
-    # Get adjacency matrix and edge information
-    adj = torch.from_numpy(Chem.rdmolops.GetAdjacencyMatrix(mol, useBO=True))
-    edge_index = adj.nonzero().contiguous().T
-    bond_types = adj[edge_index[0], edge_index[1]]
-    bond_types[bond_types == 1.5] = 4  # Aromatic bonds
-    edge_attr = bond_types.to(torch.uint8)
-    
-    # Get 3D coordinates if available
-    if mol.GetNumConformers() > 0:
-        pos = torch.tensor(mol.GetConformer().GetPositions()).float()
-    else:
-        pos = torch.zeros((mol.GetNumAtoms(), 3)).float()
-    
-    # Get atom features
-    atom_types = torch.tensor([full_atom_encoder[atom.GetSymbol()] for atom in mol.GetAtoms()], dtype=torch.uint8)
-    charges = torch.tensor([atom.GetFormalCharge() for atom in mol.GetAtoms()], dtype=torch.int8)
-    
-    # Add stereochemistry edges (CRITICAL for LoQI model!)
-    chi_bonds = [7, 8]  # R/S stereochemistry edge types
-    ez_bonds = {Chem.BondStereo.STEREOE: 5, Chem.BondStereo.STEREOZ: 6}  # E/Z edge types
-    edge_index, edge_attr = add_stereo_bonds(mol, chi_bonds, ez_bonds, edge_index, edge_attr, from_3D=True)
-    
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    r = Chem.MolFromSmiles(r_smarts, params)
+    p = Chem.MolFromSmiles(p_smarts, params)
+
+    Chem.Kekulize(r, clearAromaticFlags=True)
+    Chem.Kekulize(p, clearAromaticFlags=True)
+
+    N = r.GetNumAtoms()
+    assert p.GetNumAtoms() == N
+
+    r_perm = np.array([a.GetAtomMapNum() for a in r.GetAtoms()]) - 1
+    p_perm = np.array([a.GetAtomMapNum() for a in p.GetAtoms()]) - 1
+    r_perm_inv = np.argsort(r_perm)
+    p_perm_inv = np.argsort(p_perm)
+
+    r_atomic = np.array([r.GetAtomWithIdx(int(i)).GetAtomicNum() for i in r_perm_inv])
+    p_atomic = np.array([p.GetAtomWithIdx(int(i)).GetAtomicNum() for i in p_perm_inv])
+    assert np.array_equal(r_atomic, p_atomic)
+    numbers = torch.from_numpy(r_atomic).to(torch.uint8)
+
+    r_adj = Chem.rdmolops.GetAdjacencyMatrix(r)
+    p_adj = Chem.rdmolops.GetAdjacencyMatrix(p)
+    r_adj_perm = r_adj[r_perm_inv, :].T[r_perm_inv, :].T
+    p_adj_perm = p_adj[p_perm_inv, :].T[p_perm_inv, :].T
+
+    adj = r_adj_perm + p_adj_perm
+    row, col = adj.nonzero()
+
+    _nonbond = 0
+    r_edge_type, p_edge_type = [], []
+    for i, j in zip(r_perm_inv[row], r_perm_inv[col]):
+        b = r.GetBondBetweenAtoms(int(i), int(j))
+        r_edge_type.append(BOND_TYPES.get(b.GetBondType(), 1) if b else _nonbond)
+    for i, j in zip(p_perm_inv[row], p_perm_inv[col]):
+        b = p.GetBondBetweenAtoms(int(i), int(j))
+        p_edge_type.append(BOND_TYPES.get(b.GetBondType(), 1) if b else _nonbond)
+
+    edge_index = torch.tensor([row, col], dtype=torch.long)
+    r_edge_type = torch.tensor(r_edge_type, dtype=torch.uint8)
+    p_edge_type = torch.tensor(p_edge_type, dtype=torch.uint8)
+
+    perm = (edge_index[0] * N + edge_index[1]).argsort()
+    edge_index = edge_index[:, perm]
+    r_edge_type = r_edge_type[perm]
+    p_edge_type = p_edge_type[perm]
+
+    if add_stereo:
+        chi_bonds = (7, 8)
+        ez_bonds = {Chem.BondStereo.STEREOE: 5, Chem.BondStereo.STEREOZ: 6}
+        r_bmat = np.zeros((N, N), dtype=np.int64)
+        p_bmat = np.zeros((N, N), dtype=np.int64)
+        for idx, (i, j) in enumerate(zip(edge_index[0].tolist(), edge_index[1].tolist())):
+            r_bmat[i, j] = r_edge_type[idx].item()
+            p_bmat[i, j] = p_edge_type[idx].item()
+
+        r_reordered = Chem.RenumberAtoms(r, r_perm_inv.tolist())
+        p_reordered = Chem.RenumberAtoms(p, p_perm_inv.tolist())
+        r_bmat = add_stereo_bonds(r_reordered, chi_bonds, ez_bonds, r_bmat, from_3D=False)
+        p_bmat = add_stereo_bonds(p_reordered, chi_bonds, ez_bonds, p_bmat, from_3D=False)
+
+        existing = set(zip(edge_index[0].tolist(), edge_index[1].tolist()))
+        new_edges, new_r, new_p = [], [], []
+        for i in range(N):
+            for j in range(N):
+                if i != j and (i, j) not in existing:
+                    if r_bmat[i, j] > 0 or p_bmat[i, j] > 0:
+                        new_edges.append((i, j))
+                        new_r.append(r_bmat[i, j])
+                        new_p.append(p_bmat[i, j])
+        if new_edges:
+            new_ei = torch.tensor(new_edges, dtype=torch.long).T
+            edge_index = torch.cat([edge_index, new_ei], dim=1)
+            r_edge_type = torch.cat([r_edge_type, torch.tensor(new_r, dtype=torch.uint8)])
+            p_edge_type = torch.cat([p_edge_type, torch.tensor(new_p, dtype=torch.uint8)])
+            perm = (edge_index[0] * N + edge_index[1]).argsort()
+            edge_index = edge_index[:, perm]
+            r_edge_type = r_edge_type[perm]
+            p_edge_type = p_edge_type[perm]
+
+    edge_attr = torch.stack([r_edge_type, p_edge_type], dim=-1)
+    pos = torch.zeros(N, 3, dtype=torch.float32)
+    smiles = f"{r_smarts}>>{p_smarts}"
+
     return Data(
-        x=atom_types,
+        numbers=numbers,
+        charges=torch.full((N,), charge, dtype=torch.int8),
+        ts_coord=pos,
+        r_coord=pos.clone(),
+        p_coord=pos.clone(),
         edge_index=edge_index,
-        edge_attr=edge_attr.to(torch.uint8),
-        pos=pos,
-        charges=charges,
-        smiles=smiles,
-        mol=mol,
-        chemblid=mol.GetProp("_Name") if mol.HasProp("_Name") else ""
+        edge_attr=edge_attr,
+        num_nodes=N,
+        id=smiles,
     )
 
 
-def generate_conformers_batch(
-        smiles,
-        model,
-        cfg,
-        n_confs=10,
-        generation_batch_size=None,
-        atom_aware_batching=None,
-        shuffle=None,
-        target_molecule_size=None,
+# ---------------------------------------------------------------------------
+# Common-bond topology (union of R and P adjacency, keeping only shared bonds)
+# ---------------------------------------------------------------------------
+
+def get_bond_topology_from_smarts(reaction_smarts: str):
+    """Return (atomic_numbers, common_bonds) from a reaction SMARTS string.
+
+    common_bonds is a list of (i, j) pairs (mapped-atom indices, 0-based)
+    representing bonds that exist in BOTH reactant and product. This is used
+    to display the TS 3D structure with a reasonable connectivity.
+    """
+    r_smarts, p_smarts = reaction_smarts.split(">>")
+    params = Chem.SmilesParserParams()
+    params.removeHs = False
+    r = Chem.MolFromSmiles(r_smarts, params)
+    p = Chem.MolFromSmiles(p_smarts, params)
+
+    N = r.GetNumAtoms()
+    r_perm_inv = np.argsort(np.array([a.GetAtomMapNum() for a in r.GetAtoms()]) - 1)
+    p_perm_inv = np.argsort(np.array([a.GetAtomMapNum() for a in p.GetAtoms()]) - 1)
+
+    r_adj = Chem.rdmolops.GetAdjacencyMatrix(r)
+    p_adj = Chem.rdmolops.GetAdjacencyMatrix(p)
+    r_adj_perm = r_adj[r_perm_inv, :].T[r_perm_inv, :].T
+    p_adj_perm = p_adj[p_perm_inv, :].T[p_perm_inv, :].T
+
+    common = (r_adj_perm > 0) & (p_adj_perm > 0)
+    bonds = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            if common[i, j]:
+                bonds.append((i, j))
+
+    atomic_numbers = [r.GetAtomWithIdx(int(idx)).GetAtomicNum() for idx in r_perm_inv]
+    return atomic_numbers, bonds
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_ts_model(device: str = "auto"):
+    """Load the RitS model (single config/checkpoint)."""
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    cfg = OmegaConf.load(str(CONFIG_PATH))
+    bp = TsBatchPreProcessor(
+        aug_rotations=cfg.data.get("aug_rotations", False),
+        scale_coords=cfg.data.get("scale_coords", 1.0),
+    )
+    model = Graph3DInterpolantModel.load_from_checkpoint(
+        str(CKPT_PATH),
+        loss_params=cfg.loss,
+        interpolant_params=cfg.interpolant,
+        sampling_params=cfg.sample,
+        batch_preprocessor=bp,
+        strict=True,
+    )
+    return model.to(device).eval(), cfg, device
+
+
+# ---------------------------------------------------------------------------
+# TS sampling
+# ---------------------------------------------------------------------------
+
+def sample_transition_states(
+    reaction_smarts: str,
+    model,
+    cfg,
+    device: str,
+    n_samples: int = 5,
+    num_steps: int = 25,
+    charge: int = 0,
+    add_stereo: bool = True,
 ):
-    """
-    Generate multiple conformers for a given SMILES using the LoQI model.
-    
-    Args:
-        smiles (str): SMILES string
-        model: Trained LoQI model
-        cfg: Configuration object
-        n_confs (int): Number of conformers to generate
-        
-    Returns:
-        tuple: (generated molecules, reference molecules, seconds per structure, error message)
-    """
-    def _validate_smiles_with_disconnected_fallback(input_smiles):
-        mol_valid, _, validation_error = validate_smiles(input_smiles)
-        if validation_error is None:
-            return mol_valid, None
-        if "Disconnected fragments are not supported" not in str(validation_error):
-            return None, validation_error
+    """Sample TS geometries for a reaction. Returns list of (symbols, coords) tuples."""
+    r_smi, p_smi = reaction_smarts.split(">>")
+    data = process_reaction_smarts(r_smi, p_smi, charge=charge, add_stereo=add_stereo)
 
-        # Fallback validation path for disconnected systems (e.g., dimers).
-        mol = Chem.MolFromSmiles(str(input_smiles).strip())
-        if mol is None:
-            return None, f"RDKit failed to parse SMILES: {input_smiles!r}."
-        canonical = Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
-        mol_roundtrip = Chem.MolFromSmiles(canonical)
-        if mol_roundtrip is None:
-            return None, f"Revalidation failed after canonicalization: {canonical!r}."
-        mol_h = Chem.AddHs(mol_roundtrip)
-        for atom in mol_h.GetAtoms():
-            symbol = atom.GetSymbol()
-            if symbol not in SUPPORTED_ELEMENTS:
-                return None, (
-                    f"Unsupported element: '{symbol}'. Supported: "
-                    f"{', '.join(sorted(SUPPORTED_ELEMENTS))}."
-                )
-            if atom.GetNumRadicalElectrons() > 0:
-                return None, (
-                    f"Radical electrons are not supported "
-                    f"(atom {atom.GetIdx()} {atom.GetSymbol()})."
-                )
-        return mol_h, (
-            "Disconnected fragments detected. Proceeding in permissive mode "
-            "(experimental for dimers/multimers)."
-        )
+    all_data = [deepcopy(data) for _ in range(n_samples)]
+    loader = DataLoader(all_data, batch_size=min(n_samples, 32))
 
-    try:
-        # Validate and revalidate input SMILES first.
-        mol, validation_warning = _validate_smiles_with_disconnected_fallback(smiles)
-        if validation_warning is not None:
-            print(f"WARNING: {validation_warning}")
-        if mol is None:
-            return None, None, None, "SMILES validation failed."
+    timesteps = num_steps if num_steps is not None else cfg.interpolant.timesteps
+    results = []
 
-        # Create data list for batch processing
-        data_list = []
-        reference_mols = []
-        for _ in range(n_confs):
-            data = mol_to_torch_geometric_simple(mol, smiles)
-            data_list.append(data)
-            reference_mols.append(Chem.Mol(mol))  # Copy of original molecule for reference
-
-        if generation_batch_size is None:
-            generation_batch_size = int(
-                getattr(cfg.data, "inference_batch_size", getattr(cfg.data, "batch_size", n_confs))
-            )
-        generation_batch_size = max(1, int(generation_batch_size))
-        if atom_aware_batching is None:
-            atom_aware_batching = True
-        if shuffle is None:
-            shuffle = False
-        if target_molecule_size is None:
-            target_molecule_size = 50
-
-        # Generate conformers in batches
-        timesteps = getattr(cfg.interpolant, "timesteps", 25)
-        t0 = time.perf_counter()
-        coords_list = []
-        if atom_aware_batching:
-            sampler = AdaptiveBatchSampler(
-                data_list,
-                reference_batch_size=generation_batch_size,
-                shuffle=shuffle,
-                reference_size=target_molecule_size,
-            )
-            loader = DataLoader(data_list, batch_sampler=sampler)
-        else:
-            loader = DataLoader(data_list, batch_size=generation_batch_size, shuffle=shuffle)
+    for batch in loader:
+        batch = batch.to(device)
         with torch.no_grad():
-            for batch in loader:
-                batch = batch.to(model.device)
-                sample = model.sample(batch=batch, timesteps=timesteps, pre_format=True)
-                coords_list.extend(convert_coords_to_np(sample))
-        elapsed_s = time.perf_counter() - t0
-        per_structure_s = elapsed_s / max(len(coords_list), 1)
-        
-        # Create molecules with generated coordinates
-        generated_mols = []
-        for coords in coords_list:
-            new_mol = write_coords_to_mol(mol, coords)
-            generated_mols.append(new_mol)
-        
-        return generated_mols, reference_mols, per_structure_s, None
-        
-    except Exception as e:
-        return None, None, None, str(e)
+            sample = model.sample(batch=batch, timesteps=timesteps, pre_format=True)
+        coords_list = convert_coords_to_np(sample)
+        for k in range(len(coords_list)):
+            mask = batch["batch"] == k
+            nums = batch["numbers"][mask].cpu().numpy()
+            symbols = [Chem.GetPeriodicTable().GetElementSymbol(int(z)) for z in nums]
+            results.append((symbols, coords_list[k]))
+
+    return results
 
 
-def set_cfg_timesteps(cfg, timesteps):
-    """Set timesteps for sampling without mutating caller-owned config unexpectedly."""
-    cfg.interpolant.timesteps = int(timesteps)
-    if "evaluation" in cfg and "timesteps" in cfg.evaluation:
-        cfg.evaluation.timesteps = int(timesteps)
-    return cfg
+def coords_to_xyz_string(symbols, coords):
+    """Convert (symbols, coords) to an XYZ-format string."""
+    n = len(symbols)
+    lines = [str(n), ""]
+    for sym, c in zip(symbols, coords):
+        lines.append(f"{sym} {c[0]:.6f} {c[1]:.6f} {c[2]:.6f}")
+    return "\n".join(lines)
 
 
-def select_unique_with_irmsd(molecules, rthr=0.125):
-    """
-    Select iRMSD-unique subset from molecules.
-
-    Returns:
-        tuple: (unique_molecules, selected_indices, error_message)
-    """
-    try:
-        from irmsd import sorter_irmsd_rdkit  # type: ignore
-    except Exception:
-        return None, None, (
-            "iRMSD is not installed. Install with: pip install irmsd"
-        )
-
-    try:
-        # iinversion=2 disables inversion.
-        groups, _ = sorter_irmsd_rdkit(
-            molecules, rthr=float(rthr), iinversion=2, allcanon=True, printlvl=0
-        )
-        groups = np.asarray(groups).reshape(-1)
-        if groups.shape[0] != len(molecules):
-            return None, None, (
-                f"iRMSD returned unexpected group shape {groups.shape}; expected ({len(molecules)},)."
-            )
-
-        selected_indices = []
-        seen = set()
-        for idx, gid in enumerate(groups.tolist()):
-            if gid not in seen:
-                seen.add(gid)
-                selected_indices.append(idx)
-
-        if not selected_indices:
-            return None, None, "iRMSD did not produce any unique representatives."
-
-        unique_mols = [molecules[i] for i in selected_indices]
-        return unique_mols, selected_indices, None
-    except Exception as e:
-        return None, None, f"iRMSD pruning failed: {e}"
+def multi_xyz_string(samples):
+    """Concatenate multiple (symbols, coords) into a multi-frame XYZ string."""
+    return "\n".join(coords_to_xyz_string(s, c) for s, c in samples) + "\n"
 
 
-def create_sdf_content(molecules, energies_kcal=None, min_energy=None):
-    """
-    Create SDF content from a list of molecules with optional energy information.
-    
-    Args:
-        molecules (list): List of RDKit molecules
-        energies_kcal (array): Array of energies in kcal/mol
-        min_energy (float): Minimum energy for relative energy calculation
-        
-    Returns:
-        str: SDF content string
-    """
-    sdf_content = ""
-    
-    for i, mol in enumerate(molecules):
-        mol_copy = Chem.Mol(mol)
-        
-        # Add energy properties if available
-        if energies_kcal is not None:
-            mol_copy.SetProp("Energy_kcal_mol", f"{energies_kcal[i]:.4f}")
-            if min_energy is not None:
-                mol_copy.SetProp("Relative_Energy_kcal_mol", f"{energies_kcal[i] - min_energy:.4f}")
-            mol_copy.SetProp("Conformer_ID", str(i + 1))
-            if min_energy is not None:
-                mol_copy.SetProp("Is_Lowest_Energy", str(energies_kcal[i] == min_energy))
-        
-        sdf_content += Chem.MolToMolBlock(mol_copy)
-        sdf_content += "$$$$\n"
-    
-    return sdf_content
+# ---------------------------------------------------------------------------
+# 2D reaction visualisation (from reactions/visualize_reactions.py)
+# ---------------------------------------------------------------------------
 
-
-def safe_filename_from_smiles(smiles, suffix=""):
-    """
-    Create a safe filename from a SMILES string.
-    
-    Args:
-        smiles (str): SMILES string
-        suffix (str): Optional suffix to add
-        
-    Returns:
-        str: Safe filename
-    """
-    # Replace problematic characters
-    safe_name = smiles.replace('/', '_').replace('\\', '_').replace(':', '_')
-    safe_name = safe_name.replace('*', '_').replace('?', '_').replace('"', '_')
-    safe_name = safe_name.replace('<', '_').replace('>', '_').replace('|', '_')
-    
-    # Limit length
-    if len(safe_name) > 50:
-        safe_name = safe_name[:50]
-    
-    return f"{safe_name}{suffix}"
-
-
-def get_energy_statistics(energies_kcal, topology_results=None, stereo_results=None):
-    """
-    Calculate energy statistics from an array of energies.
-    
-    Args:
-        energies_kcal (array): Array of energies in kcal/mol
-        topology_results (dict): Topology preservation results
-        stereo_results (dict): Stereochemistry preservation results
-        
-    Returns:
-        dict: Dictionary with energy statistics (relative to minimum)
-    """
-    min_energy = float(np.min(energies_kcal))
-    min_idx = int(np.argmin(energies_kcal))
-    
-    # Find minimum among molecules with preserved topology and stereochemistry
-    preserved_min_energy = None
-    preserved_min_idx = None
-    
-    if topology_results and stereo_results:
-        topology_preserved = topology_results.get('topology_results', [])
-        stereo_preserved = stereo_results.get('stereo_results', {}).get('preserved_stereo', [])
-        
-        # If molecule has stereochemistry, require both topology and stereo preservation
-        # If no stereochemistry, only require topology preservation
-        has_stereo = stereo_results.get('has_stereochemistry', False)
-        
-        preserved_indices = []
-        for i in range(len(energies_kcal)):
-            topology_ok = i < len(topology_preserved) and topology_preserved[i]
-            
-            if has_stereo:
-                stereo_ok = i < len(stereo_preserved) and stereo_preserved[i]
-                if topology_ok and stereo_ok:
-                    preserved_indices.append(i)
-            else:
-                if topology_ok:
-                    preserved_indices.append(i)
-        
-        if preserved_indices:
-            preserved_energies = [energies_kcal[i] for i in preserved_indices]
-            preserved_min_energy = float(np.min(preserved_energies))
-            preserved_min_idx = preserved_indices[np.argmin(preserved_energies)]
-    
-    return {
-        "min_energy": min_energy,
-        "max_relative_energy": float(np.max(energies_kcal) - min_energy),
-        "mean_relative_energy": float(np.mean(energies_kcal) - min_energy),
-        "energy_range": float(np.max(energies_kcal) - min_energy),
-        "min_idx": min_idx,
-        "preserved_min_energy": preserved_min_energy,
-        "preserved_min_idx": preserved_min_idx,
-        "has_preserved_conformers": preserved_min_idx is not None
-    }
-
-
-def check_topology_preservation(molecules):
-    """
-    Check topology preservation for a list of molecules.
-    
-    Args:
-        molecules (list): List of RDKit molecules
-        
-    Returns:
-        dict: Topology preservation statistics
-    """
-    try:
-        topology_results = []
-        for mol in molecules:
-            if mol is None or mol.GetNumConformers() == 0:
-                topology_results.append(False)
-                continue
-                
-            adjacency_matrix = Chem.GetAdjacencyMatrix(mol)
-            coordinates = np.array(mol.GetConformer().GetPositions().tolist()).reshape(1, -1, 3)
-            numbers = np.array([atom.GetAtomicNum() for atom in mol.GetAtoms()])
-            
-            result = check_topology(adjacency_matrix, numbers, coordinates)
-            topology_results.append(bool(result[0]))
-        
-        preserved_count = sum(topology_results)
-        total_count = len(topology_results)
-        
-        return {
-            "topology_preserved_count": preserved_count,
-            "topology_preserved_percentage": (preserved_count / total_count * 100) if total_count > 0 else 0.0,
-            "topology_results": topology_results
-        }
-    except Exception as e:
-        return {
-            "topology_preserved_count": 0,
-            "topology_preserved_percentage": 0.0,
-            "topology_results": [False] * len(molecules),
-            "error": str(e)
-        }
-
-
-def check_stereochemistry_preservation(generated_molecules, reference_molecules):
-    """
-    Check stereochemistry preservation between generated and reference molecules.
-    Uses the same logic as StereoMetrics but processes molecules individually.
-    
-    Args:
-        generated_molecules (list): List of generated RDKit molecules
-        reference_molecules (list): List of reference RDKit molecules
-        
-    Returns:
-        dict: Stereochemistry preservation statistics
-    """
-    if not reference_molecules or len(generated_molecules) != len(reference_molecules):
-        return {
-            "stereo_preserved_count": 0,
-            "stereo_preserved_percentage": 0.0,
-            "has_stereochemistry": False,
-            "error": "Reference molecules not available or count mismatch"
-        }
-    
-    preserved_stereo = []
-    has_stereo = False
-    
-    # Process each molecule pair individually using StereoMetrics logic
-    for mol, ref_mol in zip(generated_molecules, reference_molecules):
-        if mol is None or ref_mol is None:
-            preserved_stereo.append(False)
+def _remove_h_heavy_only(mol):
+    out = Chem.RWMol()
+    heavy_idx = {}
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 1:
             continue
-        
-        # Make copies to avoid modifying originals
-        mol_copy = Chem.Mol(mol)
-        ref_copy = Chem.Mol(ref_mol)
-        
-        # Assign stereochemistry from 3D coordinates (same as StereoMetrics)
-        Chem.rdmolops.AssignStereochemistryFrom3D(ref_copy)
-        Chem.rdmolops.AssignStereochemistryFrom3D(mol_copy)
-        
-        # Get descriptors (same as StereoMetrics)
-        sr, _, ez = get_stereochemistry_descriptor(mol_copy)
-        ref_sr, _, ref_ez = get_stereochemistry_descriptor(ref_copy)
-        
-        # Check if molecule has stereochemistry
-        if ref_sr or ref_ez:
-            has_stereo = True
-            
-            # Compare only generated stereochemistry as-is (no inversion fallback).
-            rs_correct_orig = True
-            if ref_sr:
-                rs_correct_orig = (sr == ref_sr)
-            ez_correct_orig = True
-            if ref_ez:
-                ez_correct_orig = (ez == ref_ez)
-            preservation_orig = rs_correct_orig and ez_correct_orig
-            preserved_stereo.append(preservation_orig)
-        else:
-            # No stereochemistry to preserve
-            preserved_stereo.append(True)
-    
-    # Calculate statistics
-    preserved_count = sum(preserved_stereo)
-    total_count = len(preserved_stereo)
-    preserved_percentage = (preserved_count / total_count * 100) if total_count > 0 else 0.0
-    
-    return {
-        "stereo_preserved_count": preserved_count,
-        "stereo_preserved_percentage": preserved_percentage,
-        "has_stereochemistry": has_stereo,
-        "stereo_results": {
-            "preserved_stereo": preserved_stereo
-        }
-    } 
+        a = Chem.Atom(atom.GetAtomicNum())
+        a.SetChiralTag(atom.GetChiralTag())
+        if atom.GetFormalCharge() != 0:
+            a.SetFormalCharge(atom.GetFormalCharge())
+        heavy_idx[atom.GetIdx()] = out.AddAtom(a)
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if i in heavy_idx and j in heavy_idx:
+            out.AddBond(heavy_idx[i], heavy_idx[j], bond.GetBondType())
+    return Chem.Mol(out)
+
+
+def _strip_stereo(mol):
+    mol = Chem.RWMol(mol)
+    for bond in mol.GetBonds():
+        bond.SetBondDir(Chem.BondDir.NONE)
+        bond.SetStereo(Chem.BondStereo.STEREONONE)
+    for atom in mol.GetAtoms():
+        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+    return Chem.Mol(mol)
+
+
+def _clear_atom_maps(mol):
+    mol = Chem.RWMol(mol)
+    for atom in mol.GetAtoms():
+        atom.SetAtomMapNum(0)
+    return Chem.Mol(mol)
+
+
+def render_reaction_svg(smarts: str, width: int = 1200, height: int = 360) -> Optional[str]:
+    """Return an SVG string of the 2D reaction scheme (heavy atoms only, no stereo)."""
+    try:
+        rxn = rdChemReactions.ReactionFromSmarts(smarts)
+    except Exception:
+        rxn = None
+
+    if rxn is None:
+        parts = smarts.split(">>", 1)
+        if len(parts) != 2:
+            return None
+        ps = Chem.SmilesParserParams()
+        ps.removeHs = False
+        rxn = rdChemReactions.ChemicalReaction()
+        for frag in parts[0].split("."):
+            mol = Chem.MolFromSmiles(frag.strip(), ps)
+            if mol is None:
+                return None
+            rxn.AddReactantTemplate(mol)
+        for frag in parts[1].split("."):
+            mol = Chem.MolFromSmiles(frag.strip(), ps)
+            if mol is None:
+                return None
+            rxn.AddProductTemplate(mol)
+        rxn.Initialize()
+
+    draw_rxn = rdChemReactions.ChemicalReaction()
+    for i in range(rxn.GetNumReactantTemplates()):
+        mol = Chem.Mol(rxn.GetReactantTemplate(i))
+        mol = _remove_h_heavy_only(mol)
+        mol = _clear_atom_maps(mol)
+        mol = _strip_stereo(mol)
+        try:
+            rdDepictor.Compute2DCoords(mol)
+        except Exception:
+            pass
+        draw_rxn.AddReactantTemplate(mol)
+    for i in range(rxn.GetNumProductTemplates()):
+        mol = Chem.Mol(rxn.GetProductTemplate(i))
+        mol = _remove_h_heavy_only(mol)
+        mol = _clear_atom_maps(mol)
+        mol = _strip_stereo(mol)
+        try:
+            rdDepictor.Compute2DCoords(mol)
+        except Exception:
+            pass
+        draw_rxn.AddProductTemplate(mol)
+    draw_rxn.Initialize()
+
+    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+    opts = drawer.drawOptions()
+    opts.bondLineWidth = 4.0
+    opts.baseFontSize = 0.9
+    opts.minFontSize = 14
+    opts.maxFontSize = 36
+    opts.padding = 0.05
+    opts.addStereoAnnotation = False
+    opts.drawMolsSameScale = True
+    opts.clearBackground = True
+    drawer.DrawReaction(draw_rxn, highlightByReactant=False)
+    drawer.FinishDrawing()
+    return drawer.GetDrawingText()
+
+
+# ---------------------------------------------------------------------------
+# IRC helpers (from scripts/run_irc.py)
+# ---------------------------------------------------------------------------
+
+def parse_multiframe_xyz(text: str) -> list[tuple[int, str, list[str]]]:
+    """Parse multi-frame XYZ text. Returns list of (n_atoms, comment, atom_lines)."""
+    lines = text.strip().splitlines()
+    frames = []
+    i = 0
+    while i < len(lines):
+        try:
+            n = int(lines[i].strip())
+        except ValueError:
+            i += 1
+            continue
+        i += 1
+        if i >= len(lines):
+            break
+        comment = lines[i].strip()
+        i += 1
+        atom_lines = []
+        for _ in range(n):
+            if i >= len(lines):
+                break
+            atom_lines.append(lines[i])
+            i += 1
+        if len(atom_lines) == n:
+            frames.append((n, comment, atom_lines))
+    return frames
+
+
+def frame_to_xyz_string(n, comment, atom_lines):
+    return f"{n}\n{comment}\n" + "\n".join(atom_lines)
+
+
+IRC_THRESH_OPTIONS = ["gau_loose", "gau", "gau_tight", "gau_vtight"]
+IRC_TYPE_OPTIONS = ["eulerpc", "dvv", "gonzalez_schlegel", "lqa", "damped_velocity_verlet"]
+TSOPT_TYPE_OPTIONS = ["rsprfo", "rsirfo", "trim"]
+
+
+def write_pysis_yml(
+    yml_path: Path,
+    charge: int = 0,
+    mult: int = 1,
+    thresh: str = "gau",
+    max_cycles: int = 1000,
+    hessian_recalc: int = 5,
+    trust_max: float = 0.05,
+    trust_min: float = 0.001,
+    tsopt_type: str = "rsprfo",
+    irc_type: str = "eulerpc",
+    pal: int = 1,
+):
+    """Write pysisyphus YAML for TS optimisation + IRC."""
+    yml_path.write_text(f"""tsopt:
+  type: {tsopt_type}
+  hessian_recalc: {hessian_recalc}
+  assert_neg_eigval: True
+  trust_max: {trust_max}
+  trust_min: {trust_min}
+  thresh: {thresh}
+  max_cycles: {max_cycles}
+irc:
+  type: {irc_type}
+calc:
+  type: xtb
+  pal: {pal}
+  charge: {charge}
+  mult: {mult}
+geom:
+  type: cart
+  fn: [ts.xyz]
+""", encoding="utf-8")
+
+
+def run_irc_for_xyz(
+    xyz_string: str,
+    charge: int = 0,
+    mult: int = 1,
+    thresh: str = "gau",
+    max_cycles: int = 1000,
+    hessian_recalc: int = 5,
+    trust_max: float = 0.05,
+    trust_min: float = 0.001,
+    tsopt_type: str = "rsprfo",
+    irc_type: str = "eulerpc",
+    pal: int = 1,
+):
+    """Run pysisyphus IRC on a single TS XYZ string. Returns (success, irc_trj_text, run_dir)."""
+    tmp = tempfile.mkdtemp(prefix="rits_irc_")
+    run_dir = Path(tmp)
+    ts_path = run_dir / "ts.xyz"
+    ts_path.write_text(xyz_string + "\n", encoding="utf-8")
+    write_pysis_yml(
+        run_dir / "pysis.yml",
+        charge=charge, mult=mult, thresh=thresh,
+        max_cycles=max_cycles, hessian_recalc=hessian_recalc,
+        trust_max=trust_max, trust_min=trust_min,
+        tsopt_type=tsopt_type, irc_type=irc_type, pal=pal,
+    )
+
+    try:
+        subprocess.run(
+            ["pysis", "pysis.yml"],
+            cwd=run_dir,
+            check=True,
+            capture_output=True,
+            timeout=600,
+        )
+    except FileNotFoundError:
+        return False, "pysisyphus (pysis) not found. Install with: pip install pysisyphus", run_dir
+    except subprocess.CalledProcessError as e:
+        return False, f"pysis failed: {e.stderr.decode()[-500:]}", run_dir
+    except subprocess.TimeoutExpired:
+        return False, "IRC calculation timed out (10 min limit)", run_dir
+
+    trj_path = run_dir / "finished_irc.trj"
+    if trj_path.is_file():
+        return True, trj_path.read_text(encoding="utf-8"), run_dir
+    return False, "IRC finished but no trajectory file produced", run_dir

@@ -1,427 +1,377 @@
-import os
-import sys
-from dataclasses import dataclass
+import json
+import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
 import py3Dmol
 import streamlit as st
 import streamlit.components.v1 as components
-import torch
-from omegaconf import OmegaConf
-from rdkit import Chem
-from rdkit.Chem import Draw
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT / "src"))
-
-from megalodon.data.batch_preprocessor import BatchPreProcessor
-from megalodon.metrics.molecule_metrics_aimnet2 import MoleculeAIMNet2Metrics
-from megalodon.models.module import Graph3DInterpolantModel
 
 from utils import (
-    check_stereochemistry_preservation,
-    check_topology_preservation,
-    create_sdf_content,
-    generate_conformers_batch,
-    get_energy_statistics,
-    safe_filename_from_smiles,
-    select_unique_with_irmsd,
-    set_cfg_timesteps,
+    EXAMPLE_REACTIONS,
+    IRC_THRESH_OPTIONS,
+    IRC_TYPE_OPTIONS,
+    TSOPT_TYPE_OPTIONS,
+    coords_to_xyz_string,
+    frame_to_xyz_string,
+    get_bond_topology_from_smarts,
+    load_ts_model,
+    multi_xyz_string,
+    parse_multiframe_xyz,
+    render_reaction_svg,
+    run_irc_for_xyz,
+    sample_transition_states,
 )
 
-Chem.SetUseLegacyStereoPerception(True)
+# ---------------------------------------------------------------------------
+# Page config
+# ---------------------------------------------------------------------------
 
-POSTPROCESS_NONE = "none"
-POSTPROCESS_OPT = "optimization"
-POSTPROCESS_OPT_IRMSD = "optimization + irmsd unique set selection"
+st.set_page_config(page_title="RitS: TS Generator", page_icon="\u269B", layout="wide")
+st.title("\u269B RitS: Reaction-Informed Transition State Generator")
+st.markdown("Generate 3D transition-state geometries from atom-mapped reaction SMARTS")
 
-EV_TO_KCAL_PER_MOL = 23.060547830619026
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
+st.sidebar.header("Sampling")
+num_steps = st.sidebar.slider("Sampling steps", min_value=5, max_value=100, value=25)
+n_samples = st.sidebar.slider("Number of samples", min_value=1, max_value=50, value=5)
+charge = st.sidebar.number_input("Molecular charge", value=0, step=1)
+add_stereo = st.sidebar.checkbox("Add stereo information", value=True)
 
-@dataclass
-class SidebarConfig:
-    model_type: str
-    postprocess_mode: str
-    n_steps: int
-    opt_fmax: float
-    opt_max_nstep: int
-    irmsd_rthr: float
+st.sidebar.markdown("---")
+st.sidebar.header("IRC (post-processing)")
+irc_thresh = st.sidebar.selectbox("Convergence threshold", IRC_THRESH_OPTIONS, index=1)
+irc_type = st.sidebar.selectbox("IRC method", IRC_TYPE_OPTIONS, index=0)
+tsopt_type = st.sidebar.selectbox("TS optimiser", TSOPT_TYPE_OPTIONS, index=0)
+irc_max_cycles = st.sidebar.number_input("Max TS-opt cycles", value=1000, min_value=50, max_value=5000, step=50)
+irc_hessian_recalc = st.sidebar.number_input("Hessian recalc interval", value=5, min_value=1, max_value=50, step=1)
+irc_mult = st.sidebar.number_input("Spin multiplicity", value=1, min_value=1, max_value=7, step=2)
 
+if st.sidebar.button("Clear model cache"):
+    st.cache_resource.clear()
+    st.sidebar.success("Cache cleared.")
 
-@dataclass
-class OptimizationResult:
-    success: bool
-    molecules: Optional[List[Chem.Mol]] = None
-    energies_kcal: Optional[np.ndarray] = None
-    metrics: Optional[Dict[str, Any]] = None
-    warning: Optional[str] = None
-    raw_error: Optional[str] = None
-
-
-def is_optimization_enabled(postprocess_mode: str) -> bool:
-    return postprocess_mode in {POSTPROCESS_OPT, POSTPROCESS_OPT_IRMSD}
-
-
-def is_irmsd_enabled(postprocess_mode: str) -> bool:
-    return postprocess_mode == POSTPROCESS_OPT_IRMSD
-
-
-def clone_cfg(cfg):
-    """Clone config to avoid mutating cached shared objects across Streamlit sessions."""
-    return OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
-
+# ---------------------------------------------------------------------------
+# Model (cached)
+# ---------------------------------------------------------------------------
 
 @st.cache_resource
-def load_model(selected_model_type):
-    """Load model and config for selected model type."""
-    if selected_model_type == "Flow Matching":
-        config_path = ROOT / "scripts/conf/loqi/loqi_flow.yaml"
-        ckpt_path = ROOT / "data/loqi_flow.ckpt"
+def _load_model():
+    return load_ts_model()
+
+# ---------------------------------------------------------------------------
+# Input section
+# ---------------------------------------------------------------------------
+
+example_names = list(EXAMPLE_REACTIONS.keys())
+if "default_example" not in st.session_state:
+    st.session_state.default_example = random.choice(example_names)
+
+input_col, viz_col = st.columns([1, 2])
+
+with input_col:
+    st.header("Reaction input")
+    mode = st.radio("Input mode", ["Example", "Custom SMARTS"], horizontal=True)
+
+    if mode == "Example":
+        selected = st.selectbox(
+            "Choose reaction",
+            example_names,
+            index=example_names.index(st.session_state.default_example),
+        )
+        reaction_smarts = EXAMPLE_REACTIONS[selected]
     else:
-        config_path = ROOT / "scripts/conf/loqi/loqi.yaml"
-        ckpt_path = ROOT / "data/loqi.ckpt"
-
-    cfg = OmegaConf.load(config_path)
-    cfg.data.dataset_root = str(ROOT / "data/chembl3d_stereo")
-    cfg.evaluation.energy_metrics_args.model_path = str(
-        ROOT / "src/megalodon/metrics/aimnet2/cpcm_model/wb97m_cpcms_v2_0.jpt"
-    )
-
-    model = Graph3DInterpolantModel.load_from_checkpoint(
-        str(ckpt_path),
-        loss_params=cfg.loss,
-        interpolant_params=cfg.interpolant,
-        sampling_params=cfg.sample,
-        batch_preporcessor=BatchPreProcessor(cfg.data.aug_rotations, cfg.data.scale_coords),
-    )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    return model.to(device).eval(), cfg
-
-
-def evaluate_energies(molecules, cfg, fmax, max_nstep) -> OptimizationResult:
-    """Evaluate energies with AIMNet2 optimization."""
-    aimnet_path = cfg.evaluation.energy_metrics_args.model_path
-    if not os.path.exists(str(aimnet_path)):
-        msg = "AIMNet2 model not found"
-        return OptimizationResult(success=False, warning=msg, raw_error=msg)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    aimnet_batchsize = int(getattr(cfg.evaluation.energy_metrics_args, "batchsize", 100))
-    energy_metrics = MoleculeAIMNet2Metrics(
-        model_path=str(aimnet_path),
-        batchsize=aimnet_batchsize,
-        opt_metrics=True,
-        opt_params={"fmax": float(fmax), "max_nstep": int(max_nstep)},
-        device=device,
-    )
-
-    try:
-        metrics, _, opt_mols, opt_energies = energy_metrics(
-            molecules, reference_molecules=None, return_molecules=True
+        reaction_smarts = st.text_area(
+            "Reaction SMARTS (R>>P with atom maps)",
+            value=EXAMPLE_REACTIONS[st.session_state.default_example],
+            height=120,
         )
-        energies_kcal = opt_energies.cpu().numpy() * EV_TO_KCAL_PER_MOL
-        return OptimizationResult(
-            success=True,
-            molecules=opt_mols,
-            energies_kcal=energies_kcal,
-            metrics=metrics,
-        )
-    except Exception as exc:
-        raw = str(exc)
-        if isinstance(exc, UnboundLocalError) and "converged" in raw:
-            msg = (
-                "Optimization failed in the AIMNet2 optimizer backend (internal convergence-state bug). "
-                "This is usually a downstream symptom after optimization did not finish cleanly for one or more "
-                "conformers."
+
+    generate_btn = st.button("Generate transition states", type="primary")
+
+with viz_col:
+    st.header("2D Reaction")
+    if reaction_smarts and ">>" in reaction_smarts:
+        svg = render_reaction_svg(reaction_smarts.strip())
+        if svg:
+            wrapped = (
+                '<div style="width:100%;overflow:hidden;display:flex;justify-content:center;">'
+                + svg.replace('width="1200"', 'width="100%"').replace('height="360"', 'height="auto"')
+                + "</div>"
             )
+            components.html(wrapped, height=380, scrolling=False)
         else:
-            msg = "Optimization failed. Continuing without optimization."
-        return OptimizationResult(success=False, warning=msg, raw_error=raw)
+            st.warning("Could not render 2D reaction (check SMARTS syntax)")
+    else:
+        st.info("Enter a valid reaction SMARTS to see the 2D preview")
+
+# ---------------------------------------------------------------------------
+# Helper: 3D viewer with bonds from common topology
+# ---------------------------------------------------------------------------
+
+def _build_mol_block(symbols, coords, bonds):
+    """Build a V2000 MOL block from symbols, coords and bond list."""
+    n_atoms = len(symbols)
+    n_bonds = len(bonds)
+    lines = []
+    lines.append("")  # mol name
+    lines.append("     RitS")
+    lines.append("")
+    lines.append(f"{n_atoms:3d}{n_bonds:3d}  0  0  0  0  0  0  0  0999 V2000")
+    for sym, c in zip(symbols, coords):
+        lines.append(f"{c[0]:10.4f}{c[1]:10.4f}{c[2]:10.4f} {sym:<3s} 0  0  0  0  0  0  0  0  0  0  0  0")
+    for i, j in bonds:
+        lines.append(f"{i+1:3d}{j+1:3d}  1  0  0  0  0")
+    lines.append("M  END")
+    return "\n".join(lines)
 
 
-def render_2d_preview(smiles: str) -> None:
-    st.header("Molecule Visualization")
-    if not smiles:
-        return
-
-    try:
-        mol_2d = Chem.MolFromSmiles(smiles)
-        if mol_2d:
-            st.image(Draw.MolToImage(mol_2d, size=(400, 300)), caption="2D Structure")
-        else:
-            st.error("Invalid SMILES string")
-    except Exception as exc:
-        st.error(f"Error drawing 2D structure: {exc}")
-
-
-def render_3d_molecule(molecule: Chem.Mol, title: str) -> None:
-    st.subheader(title)
-    mol_block = Chem.MolToMolBlock(molecule)
-    viewer = py3Dmol.view(width=600, height=400)
+def render_ts_3d(symbols, coords, bonds, height=450, width=600):
+    """Render a TS structure in py3Dmol using common-bond topology."""
+    mol_block = _build_mol_block(symbols, coords, bonds)
+    viewer = py3Dmol.view(width=width, height=height)
     viewer.addModel(mol_block, "mol")
-    viewer.setStyle({"stick": {}})
+    viewer.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.25}})
     viewer.setBackgroundColor("white")
     viewer.zoomTo()
-    components.html(viewer._make_html(), height=400, width=600, scrolling=False)
+    return viewer._make_html()
 
 
-def build_sidebar_config() -> SidebarConfig:
-    st.sidebar.header("Configuration")
-    model_type = st.sidebar.selectbox("Model", ["Diffusion", "Flow Matching"], index=0)
-    postprocess_mode = st.sidebar.selectbox(
-        "Postprocessing",
-        [POSTPROCESS_NONE, POSTPROCESS_OPT, POSTPROCESS_OPT_IRMSD],
-        index=1,
+def _build_trajectory_html(mol_blocks, width=900, height=500):
+    """Build a self-contained HTML page with all IRC frames and a JS slider.
+
+    All data lives in the browser -- scrubbing is instant with no server
+    round-trips.
+    """
+    n = len(mol_blocks)
+    mid = n // 2
+    frames_json = json.dumps(mol_blocks)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+<style>
+  body {{ margin:0; padding:0; font-family: sans-serif; }}
+  #viewer {{ width:{width}px; height:{height}px; position:relative; }}
+  .controls {{
+    padding:10px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+  }}
+  .controls button {{
+    padding:6px 16px; border:1px solid #ccc; border-radius:6px;
+    background:#f8f8f8; cursor:pointer; font-size:14px;
+  }}
+  .controls button:hover {{ background:#e8e8e8; }}
+  #slider {{
+    flex:1; min-width:200px; height:6px;
+    -webkit-appearance:none; appearance:none;
+    background:#ddd; border-radius:3px; outline:none;
+  }}
+  #slider::-webkit-slider-thumb {{
+    -webkit-appearance:none; appearance:none;
+    width:18px; height:18px; border-radius:50%;
+    background:#4a90d9; cursor:pointer;
+  }}
+  #slider::-moz-range-thumb {{
+    width:18px; height:18px; border-radius:50%;
+    background:#4a90d9; cursor:pointer; border:none;
+  }}
+  #frame-label {{ font-size:14px; color:#555; min-width:100px; }}
+  #play-btn {{ font-size:18px; width:40px; text-align:center; }}
+</style>
+</head>
+<body>
+<div id="viewer"></div>
+<div class="controls">
+  <button onclick="goTo(0)">Reactant</button>
+  <button onclick="goTo({mid})">TS</button>
+  <button onclick="goTo({n-1})">Product</button>
+  <button id="play-btn" onclick="togglePlay()">&#9654;</button>
+  <input id="slider" type="range" min="0" max="{n-1}" value="{mid}">
+  <span id="frame-label">Frame {mid}/{n-1}</span>
+</div>
+<script>
+var frames = {frames_json};
+var viewer = $3Dmol.createViewer("viewer", {{backgroundColor:"white"}});
+var current = {mid};
+var playing = false;
+var playTimer = null;
+
+function showFrame(i) {{
+  current = i;
+  viewer.removeAllModels();
+  viewer.addModel(frames[i], "mol");
+  viewer.setStyle({{}}, {{stick:{{radius:0.15}}, sphere:{{scale:0.25}}}});
+  viewer.render();
+  document.getElementById("slider").value = i;
+  document.getElementById("frame-label").textContent = "Frame " + i + "/{n-1}";
+}}
+
+function goTo(i) {{ showFrame(i); }}
+
+document.getElementById("slider").addEventListener("input", function() {{
+  showFrame(parseInt(this.value));
+}});
+
+function togglePlay() {{
+  playing = !playing;
+  document.getElementById("play-btn").innerHTML = playing ? "&#9724;" : "&#9654;";
+  if (playing) {{
+    playTimer = setInterval(function() {{
+      var next = (current + 1) % {n};
+      showFrame(next);
+    }}, 80);
+  }} else {{
+    clearInterval(playTimer);
+  }}
+}}
+
+showFrame({mid});
+viewer.zoomTo();
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+
+if generate_btn and reaction_smarts and ">>" in reaction_smarts:
+    smarts = reaction_smarts.strip()
+
+    with st.spinner("Loading model..."):
+        model, cfg, device = _load_model()
+
+    with st.spinner(f"Sampling {n_samples} transition state(s) ({num_steps} steps)..."):
+        try:
+            samples = sample_transition_states(
+                smarts, model, cfg, device,
+                n_samples=n_samples,
+                num_steps=num_steps,
+                charge=charge,
+                add_stereo=add_stereo,
+            )
+        except Exception as e:
+            st.error(f"Sampling failed: {e}")
+            samples = []
+
+    if samples:
+        st.success(f"Generated {len(samples)} transition state(s)")
+        st.session_state["ts_samples"] = samples
+        st.session_state["ts_smarts"] = smarts
+    else:
+        st.warning("No samples generated")
+
+# ---------------------------------------------------------------------------
+# Display results
+# ---------------------------------------------------------------------------
+
+if "ts_samples" in st.session_state:
+    samples = st.session_state["ts_samples"]
+    smarts = st.session_state["ts_smarts"]
+
+    _, common_bonds = get_bond_topology_from_smarts(smarts)
+
+    st.markdown("---")
+    viewer_col, info_col = st.columns([2, 1])
+
+    with viewer_col:
+        st.header("3D Transition State")
+        idx = st.slider("Sample", 0, len(samples) - 1, 0) if len(samples) > 1 else 0
+        symbols, coords = samples[idx]
+        html = render_ts_3d(symbols, coords, common_bonds)
+        components.html(html, height=470, width=650, scrolling=False)
+
+    with info_col:
+        st.header("Info")
+        st.metric("Atoms", len(samples[0][0]))
+        st.metric("Samples", len(samples))
+        st.metric("Common bonds", len(common_bonds))
+
+        st.subheader("Download")
+        xyz_all = multi_xyz_string(samples)
+        st.download_button(
+            label="Download all samples (XYZ)",
+            data=xyz_all,
+            file_name="rits_samples.xyz",
+            mime="chemical/x-xyz",
+        )
+        xyz_single = coords_to_xyz_string(*samples[idx])
+        st.download_button(
+            label=f"Download sample {idx} (XYZ)",
+            data=xyz_single,
+            file_name=f"rits_sample_{idx}.xyz",
+            mime="chemical/x-xyz",
+        )
+
+    # -------------------------------------------------------------------
+    # IRC section
+    # -------------------------------------------------------------------
+
+    st.markdown("---")
+    st.header("IRC (Intrinsic Reaction Coordinate)")
+
+    irc_sample_idx = st.selectbox(
+        "Run IRC on sample",
+        list(range(len(samples))),
+        format_func=lambda i: f"Sample {i}",
     )
 
-    if model_type == "Flow Matching":
-        n_steps = st.sidebar.slider("Sampling Steps", min_value=1, max_value=100, value=25)
-    else:
-        n_steps = 25
-        st.sidebar.text_input("Sampling Steps (Diffusion)", value=str(n_steps), disabled=True)
+    if st.button("Run IRC", type="secondary"):
+        syms, crds = samples[irc_sample_idx]
+        xyz_str = coords_to_xyz_string(syms, crds)
+        with st.spinner("Running pysisyphus IRC (this may take several minutes)..."):
+            ok, result_text, run_dir = run_irc_for_xyz(
+                xyz_str,
+                charge=charge,
+                mult=irc_mult,
+                thresh=irc_thresh,
+                max_cycles=irc_max_cycles,
+                hessian_recalc=irc_hessian_recalc,
+                tsopt_type=tsopt_type,
+                irc_type=irc_type,
+            )
+        if ok:
+            st.success("IRC completed successfully")
+            st.session_state["irc_trajectory"] = result_text
+            st.session_state["irc_smarts"] = smarts
+        else:
+            st.error(f"IRC failed: {result_text}")
 
-    if is_optimization_enabled(postprocess_mode):
-        st.sidebar.subheader("Optimization Parameters")
-        opt_fmax = st.sidebar.number_input("fmax", min_value=1e-5, max_value=1e-1, value=2e-3, format="%.5f")
-        opt_max_nstep = st.sidebar.number_input("max_nstep", min_value=100, max_value=20000, value=3000, step=100)
-    else:
-        opt_fmax = 2e-3
-        opt_max_nstep = 3000
+    if "irc_trajectory" in st.session_state:
+        st.subheader("IRC Trajectory Viewer")
+        trj_text = st.session_state["irc_trajectory"]
+        irc_smarts = st.session_state["irc_smarts"]
+        frames = parse_multiframe_xyz(trj_text)
 
-    if is_irmsd_enabled(postprocess_mode):
-        st.sidebar.subheader("iRMSD Parameters")
-        irmsd_rthr = st.sidebar.number_input("rthr (A)", min_value=0.01, max_value=2.0, value=0.125, format="%.3f")
-    else:
-        irmsd_rthr = 0.125
+        if frames:
+            _, irc_bonds = get_bond_topology_from_smarts(irc_smarts)
+            mol_blocks = []
+            for n_at, comment, atom_lines in frames:
+                syms, crds = [], []
+                for line in atom_lines:
+                    parts = line.split()
+                    syms.append(parts[0])
+                    crds.append([float(parts[1]), float(parts[2]), float(parts[3])])
+                import numpy as np
+                mol_blocks.append(_build_mol_block(syms, np.array(crds), irc_bonds))
 
-    if st.sidebar.button("Clear Model Cache"):
-        st.cache_resource.clear()
-        st.sidebar.success("Cache cleared. The model will reload on next generation.")
+            html = _build_trajectory_html(mol_blocks)
+            components.html(html, height=600, width=920, scrolling=False)
 
-    return SidebarConfig(
-        model_type=model_type,
-        postprocess_mode=postprocess_mode,
-        n_steps=int(n_steps),
-        opt_fmax=float(opt_fmax),
-        opt_max_nstep=int(opt_max_nstep),
-        irmsd_rthr=float(irmsd_rthr),
-    )
-
-
-def build_conformer_rows(working_mols, energy_stats, energies_kcal, topology_results_display, stereo_results_display, display_idx):
-    rows = []
-    for i in range(len(working_mols)):
-        rel_energy = "N/A"
-        if energy_stats is not None:
-            rel_energy = f"{energies_kcal[i] - energy_stats['min_energy']:.2f}"
-
-        topology_ok = (
-            i < len(topology_results_display.get("topology_results", []))
-            and topology_results_display["topology_results"][i]
-        )
-        stereo_ok = True
-        if stereo_results_display.get("has_stereochemistry", False):
-            preserved = stereo_results_display.get("stereo_results", {}).get("preserved_stereo", [])
-            stereo_ok = i < len(preserved) and preserved[i]
-
-        rows.append(
-            {
-                "Conformer": i + 1,
-                "Relative Energy (kcal/mol)": rel_energy,
-                "Topology OK": "✓" if topology_ok else "✗",
-                "Stereochemistry OK": "✓" if stereo_ok else "✗"
-                if stereo_results_display.get("has_stereochemistry", False)
-                else "N/A",
-                "Is Displayed": i == display_idx,
-                "Is Best of Generated": energy_stats is not None and i == energy_stats["min_idx"],
-            }
-        )
-
-    return rows
-
-
-st.set_page_config(page_title="LoQI Conformer Generator", page_icon="🧬", layout="wide")
-st.title("🧬 LoQI: Low-Energy QM Informed Conformer Generator")
-st.markdown("Generate and visualize low-energy molecular conformers with quantum mechanical accuracy")
-
-sidebar_cfg = build_sidebar_config()
-
-left, right = st.columns([1, 2])
-with left:
-    st.header("Input")
-    smiles = st.text_input(
-        "Enter SMILES",
-        "[H]c1c([H])c([H])c2c(c1[H])C(=O)N([C@@]1([H])C(=O)N([H])C(=O)C([H])([H])C1([H])[H])C2=O",
-        help="Thalidomide example with stereochemistry",
-    )
-    n_confs = st.slider("Number of conformers", min_value=1, max_value=20, value=10)
-    generate_button = st.button("Generate Conformers", type="primary")
-
-with right:
-    render_2d_preview(smiles)
-
-
-if generate_button and smiles:
-    mol_for_warning = Chem.MolFromSmiles(smiles)
-    if mol_for_warning is not None and len(Chem.GetMolFrags(mol_for_warning)) > 1:
-        st.warning(
-            "Disconnected fragments detected. Generation will run in permissive mode "
-            "(experimental for dimers/multimers)."
-        )
-
-    with st.spinner(f"Loading {sidebar_cfg.model_type} model..."):
-        model, base_cfg = load_model(sidebar_cfg.model_type)
-        run_cfg = clone_cfg(base_cfg)
-        run_cfg = set_cfg_timesteps(run_cfg, sidebar_cfg.n_steps)
-
-    with st.spinner(f"Generating {n_confs} conformers ({sidebar_cfg.n_steps} steps)..."):
-        generation_batchsize = int(
-            getattr(run_cfg.data, "inference_batch_size", getattr(run_cfg.data, "batch_size", n_confs))
-        )
-        generated_mols, reference_mols, gen_time_per_structure_s, error = generate_conformers_batch(
-            smiles, model, run_cfg, n_confs, generation_batch_size=generation_batchsize
-        )
-
-    if error:
-        if "Disconnected fragments are not supported" in str(error):
-            st.warning(
-                "Disconnected fragments detected. Generation is experimental for dimers/multimers."
+            st.download_button(
+                label="Download IRC trajectory (XYZ)",
+                data=trj_text,
+                file_name="irc_trajectory.xyz",
+                mime="chemical/x-xyz",
             )
         else:
-            st.error(f"Error generating conformers: {error}")
-    elif generated_mols:
-        st.success(f"Generated {len(generated_mols)} conformers successfully.")
-        st.metric("Generation Time / Structure", f"{gen_time_per_structure_s:.4f} s")
+            st.warning("Could not parse IRC trajectory frames")
 
-        working_mols = generated_mols
-        working_refs = reference_mols
-        metrics_mols = generated_mols
-        metrics_refs = reference_mols
-        energies_kcal = None
-        optimization_metrics = None
-
-        if is_optimization_enabled(sidebar_cfg.postprocess_mode):
-            with st.spinner("Running optimization..."):
-                opt_result = evaluate_energies(
-                    working_mols, run_cfg, sidebar_cfg.opt_fmax, sidebar_cfg.opt_max_nstep
-                )
-
-            if not opt_result.success:
-                st.warning(opt_result.warning)
-                st.info("Continuing with generated conformers without optimization.")
-                if opt_result.raw_error:
-                    with st.expander("Optimization debug details"):
-                        st.code(opt_result.raw_error)
-            else:
-                working_mols = opt_result.molecules
-                metrics_mols = opt_result.molecules
-                energies_kcal = opt_result.energies_kcal
-                optimization_metrics = opt_result.metrics
-
-        if is_irmsd_enabled(sidebar_cfg.postprocess_mode):
-            with st.spinner("Running iRMSD unique-set selection..."):
-                unique_mols, selected_indices, irmsd_error = select_unique_with_irmsd(
-                    working_mols, rthr=sidebar_cfg.irmsd_rthr
-                )
-            if irmsd_error:
-                st.error(irmsd_error)
-                st.stop()
-            working_mols = unique_mols
-            working_refs = [working_refs[i] for i in selected_indices]
-            if energies_kcal is not None:
-                energies_kcal = np.array([energies_kcal[i] for i in selected_indices])
-            st.info(f"Unique conformers after iRMSD pruning: {len(working_mols)}")
-
-        with st.spinner("Checking topology and stereochemistry preservation..."):
-            topology_results_metrics = check_topology_preservation(metrics_mols)
-            stereo_results_metrics = check_stereochemistry_preservation(metrics_mols, metrics_refs)
-            topology_results_display = check_topology_preservation(working_mols)
-            stereo_results_display = check_stereochemistry_preservation(working_mols, working_refs)
-
-        if energies_kcal is not None:
-            energy_stats = get_energy_statistics(energies_kcal, topology_results_display, stereo_results_display)
-            if energy_stats["has_preserved_conformers"]:
-                display_idx = energy_stats["preserved_min_idx"]
-                display_type = "Lowest Energy Preserved"
-            else:
-                display_idx = energy_stats["min_idx"]
-                display_type = "Best of Generated (Overall)"
-        else:
-            energy_stats = None
-            display_idx = 0
-            display_type = "First Generated Conformer"
-
-        display_mol = working_mols[display_idx]
-
-        vis_col, stats_col = st.columns([2, 1])
-        with vis_col:
-            render_3d_molecule(display_mol, display_type)
-
-        with stats_col:
-            st.subheader("Analysis")
-            if energy_stats is not None:
-                st.metric("Highest Relative Energy", f"{energy_stats['max_relative_energy']:.2f} kcal/mol")
-                st.metric("Average Relative Energy", f"{energy_stats['mean_relative_energy']:.2f} kcal/mol")
-            else:
-                st.metric("Energies", "Not computed")
-
-            if isinstance(optimization_metrics, dict):
-                if "opt_total_time" in optimization_metrics:
-                    avg_opt_time = float(optimization_metrics["opt_total_time"]) / max(len(generated_mols), 1)
-                    st.metric("Avg Optimization Time / Structure", f"{avg_opt_time:.4f} s")
-                if "opt_avg_energy_drop" in optimization_metrics:
-                    st.metric("Avg Energy Drop", f"{optimization_metrics['opt_avg_energy_drop']:.2f} kcal/mol")
-                if "opt_converged" in optimization_metrics:
-                    st.metric("Optimization Success", f"{optimization_metrics['opt_converged'] * 100:.1f}%")
-
-            st.metric("Topology Preserved", f"{topology_results_metrics['topology_preserved_percentage']:.1f}%")
-            if stereo_results_metrics["has_stereochemistry"]:
-                st.metric("Stereochemistry Preserved", f"{stereo_results_metrics['stereo_preserved_percentage']:.1f}%")
-            else:
-                st.metric("Stereochemistry", "No R/S or E/Z centers")
-
-        st.subheader("All Conformers")
-        rows = build_conformer_rows(
-            working_mols,
-            energy_stats,
-            energies_kcal,
-            topology_results_display,
-            stereo_results_display,
-            display_idx,
-        )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-        st.subheader("Download Results")
-        sdf_content = create_sdf_content(
-            working_mols,
-            energies_kcal,
-            energy_stats["min_energy"] if energy_stats is not None else None,
-        )
-        st.download_button(
-            label="📥 Download All Conformers (SDF)",
-            data=sdf_content,
-            file_name=safe_filename_from_smiles(smiles, "_conformers.sdf"),
-            mime="chemical/x-mdl-sdfile",
-        )
-
-        single_energy = [energies_kcal[display_idx]] if energies_kcal is not None else None
-        displayed_sdf_content = create_sdf_content(
-            [display_mol],
-            single_energy,
-            energy_stats["min_energy"] if energy_stats is not None else None,
-        )
-        is_preserved = energy_stats is not None and energy_stats["has_preserved_conformers"]
-        suffix = "_best_preserved.sdf" if is_preserved else "_displayed.sdf"
-        label = "📥 Download Best Preserved Conformer (SDF)" if is_preserved else "📥 Download Displayed Conformer (SDF)"
-        st.download_button(
-            label=label,
-            data=displayed_sdf_content,
-            file_name=safe_filename_from_smiles(smiles, suffix),
-            mime="chemical/x-mdl-sdfile",
-        )
-
+# ---------------------------------------------------------------------------
+# Footer
+# ---------------------------------------------------------------------------
 st.markdown("---")
-st.markdown("**LoQI**: Low-energy QM Informed conformer generation with stereochemistry awareness")
+st.markdown("**RitS**: Reaction-Informed Transition State generation with stereochemistry awareness")

@@ -690,8 +690,8 @@ def main():
     use_obabel = True
     max_workers = mp.cpu_count() // 2  # Use half of available cores
 
-    dataset_path = '/home/fnikitin/3d_bench/data/ts_july_2025.h5'
-    save_path = '/home/fnikitin/3d_bench/data/ts_july_2025_with_bonds_and_charges.h5'
+    dataset_path = 'data/ts_july_2025.h5'
+    save_path = 'data/ts_july_2025_with_bonds_and_charges.h5'
 
     print(f"Loading dataset {dataset_path}...")
     print(f"Using {max_workers} worker processes")

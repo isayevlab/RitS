@@ -452,9 +452,9 @@ if __name__ == "__main__":
     parser.add_argument("--valid", type=float, default=0.1,
                         help="Ratio of valid data (default: 0.1, same as ts_diff)")
     parser.add_argument("--ts_data", type=str, required=True,
-                        help="Path to transition state XYZ file (e.g., data/TS/wb97xd3/raw_data/wb97xd3_ts.xyz)")
+                        help="Path to transition state XYZ file (e.g., data/Transition1x/wb97xd3/raw_data/wb97xd3_ts.xyz)")
     parser.add_argument("--rxn_smarts_file", type=str, required=True,
-                        help="Path to reaction SMARTS CSV file (e.g., data/TS/wb97xd3/raw_data/wb97xd3_fwd_rev_chemprop.csv)")
+                        help="Path to reaction SMARTS CSV file (e.g., data/Transition1x/wb97xd3/raw_data/wb97xd3_fwd_rev_chemprop.csv)")
     parser.add_argument("--save_dir", type=str, default="data/ts1x",
                         help="Directory to save the resulting PyG datasets (default: data/ts1x)")
     parser.add_argument("--ban_index", type=int, nargs="+", default=[20568, 20569, 20580, 20581],

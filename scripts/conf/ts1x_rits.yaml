@@ -1,4 +1,4 @@
-run_name: 'ts_flow_extended_data_stereo'
+run_name: 'ts1x_megalodon_flow_v9'
 outdir: null
 resume: null
 
@@ -9,19 +9,17 @@ wandb_params:
   project: 'chembl3d_megalodon_diffusion'
 
 data:
-  #dataset_root: "/home/fnikitin/stereo_pretrain_dataset"
-  dataset_root: "/home/fnikitin/ts_dataset_batch_2"
+  dataset_root: "data/ts1x"
   processed_folder: "processed"
-  batch_size: &batch_size 150
-  inference_batch_size: 150
-  data_loader_type: "midi"
+  batch_size: &batch_size 200
+  inference_batch_size: 200
+  data_loader_type: "standard"
   aug_rotations: False
   scale_coords: &scale_coords 1.0
-  ts_ratio: &ts_ratio 1.0
 
 loss:
   use_loss_clamps: True
-  loss_clamp_epoch_threshold: 3
+  loss_clamp_epoch_threshold: 10
   loss_clamps:
     ts_coord: 1.0
   variables:
@@ -71,14 +69,14 @@ interpolant:
     - variable_name: 'charges'
       interpolant_type: "discrete_null"
       concat: 'numbers'
-      num_classes: 9  # Supports charges -4 to +4 with offset 4
+      num_classes: 7
       offset: 4
       prior_type: null
 
 dynamics:
   model_name: "megav3ts"
   model_args:
-    atom_classes: 63
+    atom_classes: 61
     edge_classes: 9
     invariant_edge_feat_dim: 64
     invariant_node_feat_dim: 256
@@ -94,39 +92,36 @@ dynamics:
 
 sample:
   node_distribution: null
-  return_step_output: true  # For GoFlow: return integrated position, not velocity
+  step_lr: 1.e-6
+  clip: 1000.0
+  return_step_output: True
 
 train:
-  seed: 48
+  seed: 0
   gpus: 1
-  n_epochs: 1000
+  n_epochs: 500
   enable_progress_bar: True
-  gradient_clip_value: 1.0
+  gradient_clip_value: 3000.0
   log_freq: 50
   val_freq: 5
   checkpoint_monitor: "val/loss"
   checkpoint_monitor_mode: min
   checkpoint_every_n_train_steps: 500
 
-evaluation:
-  type: transition_states
-  max_molecules: 200
-  timesteps: *timesteps
-  scale_coords: *scale_coords
-  save_dir: "/home/fnikitin/TSMegaGen/data/${run_name}"
-  compute_stereo_metrics: True  # Enable rs_score tracking during evaluation
+evaluation: null
 
 optimizer:
   type: adamw
-  lr: 1.e-4
-  weight_decay: 1.e-12
-  amsgrad: True
+  lr: 5.e-4
+  weight_decay: 0.01
+  amsgrad: False
 
 lr_scheduler:
-  type: linear_warmup
-  initial_lr: 1.e-6
-  final_lr: 1.e-4
-  num_warmup_steps: 10000
+  type: plateau
+  factor: 0.8
+  patience: 10
+  min_lr: 0.000125
   interval: step
-  frequency: 1 #not in config but this is the default
-
+  frequency: 1
+  cooldown: 0
+  monitor: "val/loss"

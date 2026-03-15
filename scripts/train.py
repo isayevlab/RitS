@@ -46,8 +46,11 @@ def main(cfg: DictConfig) -> None:
     os.makedirs(cfg.outdir, exist_ok=True)
     os.makedirs(os.path.join(cfg.outdir, 'checkpoints'), exist_ok=True)
     loss_fn = None
+    eval_type = OmegaConf.select(cfg, "evaluation.type", default=None)
+    model_name = OmegaConf.select(cfg, "dynamics.model_name", default=None)
+    is_ts_run = (eval_type == "transition_states") or (model_name == "megav3ts")
 
-    if cfg.evaluation.type == "transition_states":
+    if is_ts_run:
         ts_ratio = OmegaConf.select(cfg, "data.ts_ratio", default=1.0)
         logging.info(f"TS ratio (curriculum learning): {ts_ratio}")
         batch_preprocessor = TsBatchPreProcessor(
@@ -129,7 +132,8 @@ def main(cfg: DictConfig) -> None:
         save_on_train_epoch_end=True,
         filename="best_train-{epoch}-{step}",
     )
-    if cfg.evaluation.type == "molecules":
+    evaluation_callback = None
+    if eval_type == "molecules":
         energy_metrics_args = OmegaConf.to_container(cfg.evaluation.energy_metrics_args,
                                                  resolve=True) if cfg.evaluation.energy_metrics_args is not None else None
         statistics = Statistics.load_statistics(
@@ -150,7 +154,7 @@ def main(cfg: DictConfig) -> None:
             preserve_aromatic=OmegaConf.select(cfg.evaluation, "preserve_aromatic", default=True)
         )
 
-    elif cfg.evaluation.type == "conformers":
+    elif eval_type == "conformers":
         energy_metrics_args = OmegaConf.to_container(cfg.evaluation.energy_metrics_args,
                                                  resolve=True) if cfg.evaluation.energy_metrics_args is not None else None
         statistics = Statistics.load_statistics(
@@ -166,14 +170,14 @@ def main(cfg: DictConfig) -> None:
             scale_coords=cfg.evaluation.scale_coords,
             compute_stereo_metrics=cfg.evaluation.compute_stereo_metrics
         )
-    elif cfg.evaluation.type == "transition_states":
+    elif eval_type == "transition_states":
         evaluation_callback = TransitionStatesEvaluationCallback(
             max_molecules=cfg.evaluation.max_molecules,
             timesteps=cfg.evaluation.timesteps,
             scale_coords=cfg.evaluation.scale_coords,
             save_dir=cfg.evaluation.save_dir
         )
-    else: 
+    elif eval_type is not None:
         raise NotImplementedError
 
     if 'num_nodes' in cfg.train:
@@ -181,11 +185,19 @@ def main(cfg: DictConfig) -> None:
     else:
         num_nodes = 1
 
+    callbacks = [
+        lr_monitor,
+        last_checkpoint_callback,
+        best_checkpoint_callback,
+        train_loss_checkpoint_callback,
+    ]
+    if evaluation_callback is not None:
+        callbacks.insert(1, evaluation_callback)
+
     trainer = pl.Trainer(
         max_epochs=cfg.train.n_epochs,
         logger=logger,
-        callbacks=[lr_monitor, evaluation_callback, last_checkpoint_callback,
-                   best_checkpoint_callback, train_loss_checkpoint_callback],
+        callbacks=callbacks,
         enable_progress_bar=cfg.train.enable_progress_bar,
         accelerator='gpu',
         devices=cfg.train.gpus,
