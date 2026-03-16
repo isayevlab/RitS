@@ -26,8 +26,8 @@ from utils import (
 # Page config
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="RitS", page_icon="\u269B", layout="wide")
-st.title("\u269B Right into the Saddle")
+st.set_page_config(page_title="RitS", page_icon="\U0001F920", layout="wide")
+st.title("\U0001F920 Right into the Saddle")
 st.markdown("Stereochemistry-Aware Generation of Molecular Transition States")
 
 # ---------------------------------------------------------------------------
@@ -69,12 +69,13 @@ example_names = list(EXAMPLE_REACTIONS.keys())
 if "default_example" not in st.session_state:
     st.session_state.default_example = random.choice(example_names)
 
-input_col, viz_col = st.columns([1, 2])
+st.header("Reaction input")
+input_col1, input_col2 = st.columns([1, 1])
 
-with input_col:
-    st.header("Reaction input")
+with input_col1:
     mode = st.radio("Input mode", ["Example", "Custom SMARTS"], horizontal=True)
 
+with input_col2:
     if mode == "Example":
         selected = st.selectbox(
             "Choose reaction",
@@ -89,23 +90,23 @@ with input_col:
             height=120,
         )
 
-    generate_btn = st.button("Generate transition states", type="primary")
+generate_btn = st.button("Generate transition states", type="primary")
 
-with viz_col:
-    st.header("2D Reaction")
-    if reaction_smarts and ">>" in reaction_smarts:
-        svg = render_reaction_svg(reaction_smarts.strip())
-        if svg:
-            wrapped = (
-                '<div style="width:100%;overflow:hidden;display:flex;justify-content:center;">'
-                + svg.replace('width="1200"', 'width="100%"').replace('height="360"', 'height="auto"')
-                + "</div>"
-            )
-            components.html(wrapped, height=380, scrolling=False)
-        else:
-            st.warning("Could not render 2D reaction (check SMARTS syntax)")
+st.header("2D Reaction")
+if reaction_smarts and ">>" in reaction_smarts:
+    svg = render_reaction_svg(reaction_smarts.strip())
+    if svg:
+        svg_clean = svg.replace("<?xml version='1.0' encoding='iso-8859-1'?>", "")
+        svg_responsive = (
+            '<div style="width:100%;">'
+            + svg_clean.replace("width='1600px'", "width='100%'").replace("height='500px'", "")
+            + "</div>"
+        )
+        st.markdown(svg_responsive, unsafe_allow_html=True)
     else:
-        st.info("Enter a valid reaction SMARTS to see the 2D preview")
+        st.warning("Could not render 2D reaction (check SMARTS syntax)")
+else:
+    st.info("Enter a valid reaction SMARTS to see the 2D preview")
 
 # ---------------------------------------------------------------------------
 # Helper: 3D viewer with bonds from common topology

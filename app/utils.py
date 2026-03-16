@@ -417,7 +417,7 @@ def _clear_atom_maps(mol):
     return Chem.Mol(mol)
 
 
-def render_reaction_svg(smarts: str, width: int = 1200, height: int = 360) -> Optional[str]:
+def render_reaction_svg(smarts: str, width: int = 1600, height: int = 500) -> Optional[str]:
     """Return an SVG string of the 2D reaction scheme (heavy atoms only, no stereo)."""
     try:
         rxn = rdChemReactions.ReactionFromSmarts(smarts)
