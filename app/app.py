@@ -1,8 +1,6 @@
-import json
 import random
-from pathlib import Path
 
-import py3Dmol
+import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -21,6 +19,7 @@ from utils import (
     run_irc_for_xyz,
     sample_transition_states,
 )
+from viewer_utils import build_mol_block, build_trajectory_html, render_ts_3d
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -107,133 +106,6 @@ if reaction_smarts and ">>" in reaction_smarts:
         st.warning("Could not render 2D reaction (check SMARTS syntax)")
 else:
     st.info("Enter a valid reaction SMARTS to see the 2D preview")
-
-# ---------------------------------------------------------------------------
-# Helper: 3D viewer with bonds from common topology
-# ---------------------------------------------------------------------------
-
-def _build_mol_block(symbols, coords, bonds):
-    """Build a V2000 MOL block from symbols, coords and bond list."""
-    n_atoms = len(symbols)
-    n_bonds = len(bonds)
-    lines = []
-    lines.append("")  # mol name
-    lines.append("     RitS")
-    lines.append("")
-    lines.append(f"{n_atoms:3d}{n_bonds:3d}  0  0  0  0  0  0  0  0999 V2000")
-    for sym, c in zip(symbols, coords):
-        lines.append(f"{c[0]:10.4f}{c[1]:10.4f}{c[2]:10.4f} {sym:<3s} 0  0  0  0  0  0  0  0  0  0  0  0")
-    for i, j in bonds:
-        lines.append(f"{i+1:3d}{j+1:3d}  1  0  0  0  0")
-    lines.append("M  END")
-    return "\n".join(lines)
-
-
-def render_ts_3d(symbols, coords, bonds, height=450, width=600):
-    """Render a TS structure in py3Dmol using common-bond topology."""
-    mol_block = _build_mol_block(symbols, coords, bonds)
-    viewer = py3Dmol.view(width=width, height=height)
-    viewer.addModel(mol_block, "mol")
-    viewer.setStyle({"stick": {"radius": 0.15}, "sphere": {"scale": 0.25}})
-    viewer.setBackgroundColor("white")
-    viewer.zoomTo()
-    return viewer._make_html()
-
-
-def _build_trajectory_html(mol_blocks, width=900, height=500):
-    """Build a self-contained HTML page with all IRC frames and a JS slider.
-
-    All data lives in the browser -- scrubbing is instant with no server
-    round-trips.
-    """
-    n = len(mol_blocks)
-    mid = n // 2
-    frames_json = json.dumps(mol_blocks)
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-<script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-<style>
-  body {{ margin:0; padding:0; font-family: sans-serif; }}
-  #viewer {{ width:{width}px; height:{height}px; position:relative; }}
-  .controls {{
-    padding:10px 0; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
-  }}
-  .controls button {{
-    padding:6px 16px; border:1px solid #ccc; border-radius:6px;
-    background:#f8f8f8; cursor:pointer; font-size:14px;
-  }}
-  .controls button:hover {{ background:#e8e8e8; }}
-  #slider {{
-    flex:1; min-width:200px; height:6px;
-    -webkit-appearance:none; appearance:none;
-    background:#ddd; border-radius:3px; outline:none;
-  }}
-  #slider::-webkit-slider-thumb {{
-    -webkit-appearance:none; appearance:none;
-    width:18px; height:18px; border-radius:50%;
-    background:#4a90d9; cursor:pointer;
-  }}
-  #slider::-moz-range-thumb {{
-    width:18px; height:18px; border-radius:50%;
-    background:#4a90d9; cursor:pointer; border:none;
-  }}
-  #frame-label {{ font-size:14px; color:#555; min-width:100px; }}
-  #play-btn {{ font-size:18px; width:40px; text-align:center; }}
-</style>
-</head>
-<body>
-<div id="viewer"></div>
-<div class="controls">
-  <button onclick="goTo(0)">Reactant</button>
-  <button onclick="goTo({mid})">TS</button>
-  <button onclick="goTo({n-1})">Product</button>
-  <button id="play-btn" onclick="togglePlay()">&#9654;</button>
-  <input id="slider" type="range" min="0" max="{n-1}" value="{mid}">
-  <span id="frame-label">Frame {mid}/{n-1}</span>
-</div>
-<script>
-var frames = {frames_json};
-var viewer = $3Dmol.createViewer("viewer", {{backgroundColor:"white"}});
-var current = {mid};
-var playing = false;
-var playTimer = null;
-
-function showFrame(i) {{
-  current = i;
-  viewer.removeAllModels();
-  viewer.addModel(frames[i], "mol");
-  viewer.setStyle({{}}, {{stick:{{radius:0.15}}, sphere:{{scale:0.25}}}});
-  viewer.render();
-  document.getElementById("slider").value = i;
-  document.getElementById("frame-label").textContent = "Frame " + i + "/{n-1}";
-}}
-
-function goTo(i) {{ showFrame(i); }}
-
-document.getElementById("slider").addEventListener("input", function() {{
-  showFrame(parseInt(this.value));
-}});
-
-function togglePlay() {{
-  playing = !playing;
-  document.getElementById("play-btn").innerHTML = playing ? "&#9724;" : "&#9654;";
-  if (playing) {{
-    playTimer = setInterval(function() {{
-      var next = (current + 1) % {n};
-      showFrame(next);
-    }}, 80);
-  }} else {{
-    clearInterval(playTimer);
-  }}
-}}
-
-showFrame({mid});
-viewer.zoomTo();
-</script>
-</body>
-</html>"""
-
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -356,10 +228,9 @@ if "ts_samples" in st.session_state:
                     parts = line.split()
                     syms.append(parts[0])
                     crds.append([float(parts[1]), float(parts[2]), float(parts[3])])
-                import numpy as np
-                mol_blocks.append(_build_mol_block(syms, np.array(crds), irc_bonds))
+                mol_blocks.append(build_mol_block(syms, np.array(crds), irc_bonds))
 
-            html = _build_trajectory_html(mol_blocks)
+            html = build_trajectory_html(mol_blocks)
             components.html(html, height=600, width=920, scrolling=False)
 
             st.download_button(
@@ -370,4 +241,3 @@ if "ts_samples" in st.session_state:
             )
         else:
             st.warning("Could not parse IRC trajectory frames")
-
