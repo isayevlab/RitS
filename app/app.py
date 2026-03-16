@@ -371,8 +371,3 @@ if "ts_samples" in st.session_state:
         else:
             st.warning("Could not parse IRC trajectory frames")
 
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.markdown("**RitS**: Reaction-Informed Transition State generation with stereochemistry awareness")
