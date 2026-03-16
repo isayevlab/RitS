@@ -26,9 +26,9 @@ from utils import (
 # Page config
 # ---------------------------------------------------------------------------
 
-st.set_page_config(page_title="RitS: TS Generator", page_icon="\u269B", layout="wide")
-st.title("\u269B RitS: Reaction-Informed Transition State Generator")
-st.markdown("Generate 3D transition-state geometries from atom-mapped reaction SMARTS")
+st.set_page_config(page_title="RitS", page_icon="\u269B", layout="wide")
+st.title("\u269B Right into the Saddle")
+st.markdown("Stereochemistry-Aware Generation of Molecular Transition States")
 
 # ---------------------------------------------------------------------------
 # Sidebar

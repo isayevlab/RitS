@@ -299,9 +299,16 @@ def get_bond_topology_from_smarts(reaction_smarts: str):
 # ---------------------------------------------------------------------------
 
 def load_ts_model(device: str = "auto"):
-    """Load the RitS model (single config/checkpoint)."""
+    """Load the RitS model (single config/checkpoint).
+
+    Device resolution order:
+      1. Explicit argument (if not "auto")
+      2. RITS_DEVICE environment variable
+      3. "cuda" if available, else "cpu"
+    """
+    import os
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = os.environ.get("RITS_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
     cfg = OmegaConf.load(str(CONFIG_PATH))
     bp = TsBatchPreProcessor(
