@@ -42,16 +42,19 @@ EXAMPLE_REACTIONS = {
         "[C:1]([N:2]([H:8])[H:9])([H:5])([H:6])[H:7]"
         ".[C:3]([C:4](=[O:13])[O:14][H:15])([H:10])([H:11])[H:12]"
     ),
-    "Diels-Alder": (
-        "[C:12](#[C:13][C@@:14]1([H:29])[C:15]([H:30])([H:31])[N:16]([H:32])"
-        "[C:17]([H:33])([H:34])[C:18]1([H:35])[H:36])[H:28]"
-        ".[C:1](=[C:2](/[C:3](=[C:4](\\[C:5]([C:6](=[O:7])[O:8][C:9](=[O:10])"
-        "[N:11]([H:26])[H:27])([H:24])[H:25])[H:23])[H:22])[H:21])([H:19])[H:20]"
+    "Diels-Alder (exo)": (
+        "[C:1]1([H:6])=[C:2]([H:7])[C:3]([H:8])=[C:4]([H:9])[C:5]1([H:10])[H:11]"
+        ".[N:12]#[C:13]/[C:14](=[C:15](\\[C:16]#[N:17])[H:19])[H:18]"
         ">>"
-        "[C:1]1([H:19])([H:20])[C:2]([H:21])=[C:3]([H:22])[C@:4]([C:5]([C:6](=[O:7])"
-        "[O:8][C:9](=[O:10])[N:11]([H:26])[H:27])([H:24])[H:25])([H:23])"
-        "[C:12]([H:28])=[C:13]1[C@@:14]1([H:29])[C:15]([H:30])([H:31])"
-        "[N:16]([H:32])[C:17]([H:33])([H:34])[C:18]1([H:35])[H:36]"
+        "[C@:1]12([H:6])[C:2]([H:7])=[C:3]([H:8])[C@:4]([H:9])([C:5]1([H:10])[H:11])"
+        "[C@@:15]([C:16]#[N:17])([H:19])[C@@:14]2([C:13]#[N:12])[H:18]"
+    ),
+    "Diels-Alder (endo)": (
+        "[C:1]1([H:6])=[C:2]([H:7])[C:3]([H:8])=[C:4]([H:9])[C:5]1([H:10])[H:11]"
+        ".[N:12]#[C:13]/[C:14](=[C:15](\\[C:16]#[N:17])[H:19])[H:18]"
+        ">>"
+        "[C@:1]12([H:6])[C:2]([H:7])=[C:3]([H:8])[C@:4]([H:9])([C:5]1([H:10])[H:11])"
+        "[C@:15]([C:16]#[N:17])([H:19])[C@:14]2([C:13]#[N:12])[H:18]"
     ),
     "Click chemistry (CuAAC)": (
         "[C:1]([C:2](=[O:3])[O:4][C:5]([C:6]([C:7]([N:8]=[N+:9]=[N-:10])"
@@ -84,16 +87,23 @@ EXAMPLE_REACTIONS = {
         "[C:11]([H:12])([H:13])([H:14])[N:15]=[C:16]=[O:17]"
         ".[C:1](=[C:2]([C:3]([O:4][H:5])([H:9])[H:10])[H:8])([H:6])[H:7]"
         ">>"
-        "[C:1](=[C:2](/[C@@:3]([O:4][C:16]([N:15]([H:5])[C@@:11]([H:12])([H:13])"
-        "[H:14])=[O:17])([H:9])[H:10])[H:8])(\\[H:6])[H:7]"
+        "[C:1](=[C:2]([C:3]([O:4][C:16]([N:15]([H:5])[C:11]([H:12])([H:13])"
+        "[H:14])=[O:17])([H:9])[H:10])[H:8])([H:6])[H:7]"
     ),
-    "E2 elimination (chlorostyrene)": (
+    "E2 elimination (chlorostyrene, E)": (
         "[C:1]1([C:7]([C:8]([Cl:9])([Cl:10])[H:18])([H:16])[H:17])=[C:2]([H:11])"
         "[C:3]([H:12])=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15]"
         ">>"
-        "[C:1]1([C:7](=[C:8]([Cl:9])[H:18])[H:16])=[C:2]([H:11])[C:3]([H:12])"
+        "[C:1]1(/[C:7]([H:16])=[C:8](/[Cl:9])[H:18])=[C:2]([H:11])[C:3]([H:12])"
         "=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15].[Cl:10][H:17]"
     ),
+    "E2 elimination (chlorostyrene, Z)": (
+        "[C:1]1([C:7]([C:8]([Cl:9])([Cl:10])[H:18])([H:16])[H:17])=[C:2]([H:11])"
+        "[C:3]([H:12])=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15]"
+        ">>"
+        "[C:1]1(/[C:7]([H:16])=[C:8](\\[Cl:9])[H:18])=[C:2]([H:11])[C:3]([H:12])"
+        "=[C:4]([H:13])[C:5]([H:14])=[C:6]1[H:15].[Cl:10][H:17]"
+    )
 }
 
 # ---------------------------------------------------------------------------
@@ -382,89 +392,60 @@ def multi_xyz_string(samples):
 # 2D reaction visualisation (from reactions/visualize_reactions.py)
 # ---------------------------------------------------------------------------
 
-def _remove_h_heavy_only(mol):
-    out = Chem.RWMol()
-    heavy_idx = {}
-    for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 1:
-            continue
-        a = Chem.Atom(atom.GetAtomicNum())
-        a.SetChiralTag(atom.GetChiralTag())
-        if atom.GetFormalCharge() != 0:
-            a.SetFormalCharge(atom.GetFormalCharge())
-        heavy_idx[atom.GetIdx()] = out.AddAtom(a)
-    for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        if i in heavy_idx and j in heavy_idx:
-            out.AddBond(heavy_idx[i], heavy_idx[j], bond.GetBondType())
-    return Chem.Mol(out)
 
-
-def _strip_stereo(mol):
+def _clean_spurious_stereo(mol: Chem.Mol) -> Chem.Mol:
+    """Remove spurious tetrahedral stereo: keep only true C chiral centers.
+    E/Z on double bonds is preserved."""
     mol = Chem.RWMol(mol)
-    for bond in mol.GetBonds():
-        bond.SetBondDir(Chem.BondDir.NONE)
-        bond.SetStereo(Chem.BondStereo.STEREONONE)
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+    true_centers = {
+        idx
+        for idx, _ in Chem.FindMolChiralCenters(mol, includeUnassigned=False)
+        if mol.GetAtomWithIdx(idx).GetAtomicNum() == 6
+    }
     for atom in mol.GetAtoms():
-        atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
+        if atom.GetIdx() not in true_centers:
+            atom.SetChiralTag(Chem.ChiralType.CHI_UNSPECIFIED)
     return Chem.Mol(mol)
 
 
-def _clear_atom_maps(mol):
+def _prepare_fragment(smi: str) -> Optional[Chem.Mol]:
+    """Parse SMILES, sanitize, kekulize, remove Hs, clear atom maps, clean spurious stereo."""
+    ps = Chem.SmilesParserParams()
+    ps.removeHs = False
+    mol = Chem.MolFromSmiles(smi, ps)
+    if mol is None:
+        return None
+    Chem.SanitizeMol(mol)
+    Chem.Kekulize(mol, clearAromaticFlags=True)
+    mol = Chem.RemoveAllHs(mol)
+    mol = _clean_spurious_stereo(mol)
     mol = Chem.RWMol(mol)
     for atom in mol.GetAtoms():
         atom.SetAtomMapNum(0)
-    return Chem.Mol(mol)
+    mol = Chem.Mol(mol)
+    rdDepictor.Compute2DCoords(mol)
+    return mol
 
 
 def render_reaction_svg(smarts: str, width: int = 1600, height: int = 500) -> Optional[str]:
-    """Return an SVG string of the 2D reaction scheme (heavy atoms only, no stereo)."""
-    try:
-        rxn = rdChemReactions.ReactionFromSmarts(smarts)
-    except Exception:
-        rxn = None
+    """Return an SVG string of the 2D reaction scheme (heavy atoms only, with stereo)."""
+    parts = smarts.split(">>", 1)
+    if len(parts) != 2:
+        return None
 
-    if rxn is None:
-        parts = smarts.split(">>", 1)
-        if len(parts) != 2:
+    rxn = rdChemReactions.ChemicalReaction()
+    for frag in parts[0].split("."):
+        mol = _prepare_fragment(frag.strip())
+        if mol is None:
             return None
-        ps = Chem.SmilesParserParams()
-        ps.removeHs = False
-        rxn = rdChemReactions.ChemicalReaction()
-        for frag in parts[0].split("."):
-            mol = Chem.MolFromSmiles(frag.strip(), ps)
-            if mol is None:
-                return None
-            rxn.AddReactantTemplate(mol)
-        for frag in parts[1].split("."):
-            mol = Chem.MolFromSmiles(frag.strip(), ps)
-            if mol is None:
-                return None
-            rxn.AddProductTemplate(mol)
-        rxn.Initialize()
-
-    draw_rxn = rdChemReactions.ChemicalReaction()
-    for i in range(rxn.GetNumReactantTemplates()):
-        mol = Chem.Mol(rxn.GetReactantTemplate(i))
-        mol = _remove_h_heavy_only(mol)
-        mol = _clear_atom_maps(mol)
-        mol = _strip_stereo(mol)
-        try:
-            rdDepictor.Compute2DCoords(mol)
-        except Exception:
-            pass
-        draw_rxn.AddReactantTemplate(mol)
-    for i in range(rxn.GetNumProductTemplates()):
-        mol = Chem.Mol(rxn.GetProductTemplate(i))
-        mol = _remove_h_heavy_only(mol)
-        mol = _clear_atom_maps(mol)
-        mol = _strip_stereo(mol)
-        try:
-            rdDepictor.Compute2DCoords(mol)
-        except Exception:
-            pass
-        draw_rxn.AddProductTemplate(mol)
-    draw_rxn.Initialize()
+        rxn.AddReactantTemplate(mol)
+    for frag in parts[1].split("."):
+        mol = _prepare_fragment(frag.strip())
+        if mol is None:
+            return None
+        rxn.AddProductTemplate(mol)
+    rxn.Initialize()
 
     drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
     opts = drawer.drawOptions()
@@ -473,10 +454,10 @@ def render_reaction_svg(smarts: str, width: int = 1600, height: int = 500) -> Op
     opts.minFontSize = 14
     opts.maxFontSize = 36
     opts.padding = 0.05
-    opts.addStereoAnnotation = False
+    opts.addStereoAnnotation = True
     opts.drawMolsSameScale = True
     opts.clearBackground = True
-    drawer.DrawReaction(draw_rxn, highlightByReactant=False)
+    drawer.DrawReaction(rxn, highlightByReactant=False)
     drawer.FinishDrawing()
     return drawer.GetDrawingText()
 
