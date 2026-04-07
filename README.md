@@ -277,7 +277,7 @@ RitS preprint citation:
 
 ```bibtex
 @article{
-doi:10.26434/chemrxiv.15001681/v1,
+rits,
 author = {Filipp Nikitin  and Dylan M. Anstine  and Olexandr Isayev },
 title = {Right into the Saddle: Stereochemistry-Aware Generation of Molecular Transition States},
 journal = {ChemRxiv},
