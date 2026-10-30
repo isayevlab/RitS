@@ -106,10 +106,16 @@ Release folder: [Google Drive](https://drive.google.com/drive/folders/1xGX0uZgaG
 
 Available now:
 
-- Transition1x training data
+- TSDiff/Grambow training data (legacy `Transition1x` download paths)
 - RGD1-ChEMBL-extended GFN2-xTB training data (`data/rgd1_chembl_extended.h5`)
-- Transition1x checkpoint (`data/ts1x_rits.ckpt`)
+- Earlier TSDiff/Grambow checkpoint (`data/ts1x_rits.ckpt`)
 - RitS checkpoint trained on RGD1-ChEMBL-extended (`data/rits.ckpt`)
+
+The manuscript release uses `rits.ckpt`, `rits_finetuned.ckpt` and
+`rits_tsdiff.ckpt`. See [Running the released checkpoints](docs/released_checkpoints.md)
+for each model's training setting, matching configuration, runnable inference
+commands and SHA-256 checksum. The older `ts1x_rits.ckpt` is not the selected
+`rits_tsdiff.ckpt`; use the released file rather than renaming the older checkpoint.
 
 Expected local layout after downloading and preprocessing both datasets:
 
@@ -272,7 +278,7 @@ python scripts/sample_transition_state.py \
 **Transition State Configs:**
 
 - `rits.yaml` - RitS stereochemistry-aware conformer generation model trained on our dataset
-- `ts1x_rits.yaml` - RitS configuration for Transition1x training/evaluation
+- `ts1x_rits.yaml` - RitS-TSDiff configuration for TSDiff/Grambow training/evaluation
 
 ### Interactive App
 
