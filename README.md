@@ -11,7 +11,7 @@
   <br>
   <sup>3</sup>Department of Chemical Engineering and Materials Science, Michigan State University, East Lansing, MI, USA
   <br><br>
-  <a href="#" target="_blank">📄 Paper</a>   <b>·</b>  
+  <a href="https://doi.org/10.26434/chemrxiv.15001681/v1" target="_blank">📄 Paper</a>   <b>·</b>  
   <a href="#citation">📖 Citation</a>   <b>·</b>  
   <a href="#setup">⚙️ Setup</a>   <b>·</b>  
   <a href="https://github.com/isayevlab/rits" target="_blank">🔗 GitHub</a>
@@ -29,13 +29,13 @@
 
 ### Abstract
 
-Traditional strategies for calculating molecular transition states are laborious and computationally intensive, thus bottlenecking the scale of reaction modeling. To overcome this limitation, we introduce a flow-matching model, RitS, that directly generates high-quality transition states using only the connectivity of reactants and products as input. Leveraging a newly constructed dataset of approximately 1.7 million transition states, we substantially expand the applicability of previous approaches, which are typically trained on the Transition1x dataset, to cover CHNOSFP elements, larger molecular systems, and both neutral and charged reactions. On the Transition1x benchmark, our model achieves superior performance compared to existing generative approaches. Importantly, RitS enables stereochemistry-aware transition-state generation. We demonstrate selective generation of endo/exo Diels-Alder transition states as well as stereodefined E/Z transition states for chlorostyrene halogenation reactions. Furthermore, the model generalizes to complex multistep organocatalytic reactions, including the classical Hajos-Parrish-Eder-Sauer-Wiechert reaction. Overall, this work represents an important step toward scalable, automated, and high-throughput reaction mechanism analysis that can continue to improve as larger mechanistic datasets become available.
+Determination of transition state structures is fundamental to the mechanistic understanding of chemical reactivity and selectivity, yet conventional approaches require extensive expert intervention for geometry preparation and saddle-point optimization, severely limiting the throughput of computational reaction analysis. We present RitS, a generative model trained on a curated dataset of approximately 1.7 million transition states computed at the GFN2-xTB level of theory. RitS generates three-dimensional transition-state geometries directly from reactant–product bond connectivity without requiring pre-optimized molecular structures as input. The model accommodates H, B, C, N, O, F, Si, P, S, Cl, Br, I elements, systems containing up to 51 total atoms, and both neutral and charged species, substantially extending the chemical scope of prior generative approaches. Benchmarking on the same TSDiff/Grambow test set demonstrates that RitS, both after benchmark fine-tuning and when trained from scratch on the benchmark, generates structures closer to the reference geometries than TSDiff and GoFlow. A key capability of RitS is stereochemistry-aware generation: encoding product chirality in the input graph enables selective generation of competing diastereomeric transition states, as demonstrated for *endo* versus *exo* Diels–Alder cycloadditions and E versus Z elimination pathways. The model further extends to the multistep Hajos–Parrish–Eder–Sauer–Wiechert organocatalytic cycle, capturing each elementary step including the enantiodetermining intramolecular aldol transition state. Comparison of competing transition states refined with UMA also reproduces the experimentally favored products in seven stereoselective and regioselective reactions. These results establish RitS as a tool for automated, high-throughput transition-state generation applicable to mechanistic studies, selectivity analysis, and large-scale reaction network exploration.
 
 ## Key Features
 
-- **Direct transition-state generation**Generates 3D transition-state geometries directly from reactant and product connectivity without requiring hand-crafted initial guesses.
-- **Stereochemistry-aware generation**Supports explicit stereochemical control, enabling generation of transition states corresponding to competing pathways such as **endo/exo** and **E/Z** configurations.
-- **Flow-matching generative model**Uses a flow-matching objective with **Kabsch-aligned optimal transport** for stable and efficient molecular geometry generation.
+- **Direct transition-state generation**: Generates 3D transition-state geometries directly from reactant and product connectivity without requiring hand-crafted initial guesses.
+- **Stereochemistry-aware generation**: Supports explicit stereochemical control, enabling generation of transition states corresponding to competing pathways such as **endo/exo** and **E/Z** configurations.
+- **Flow-matching generative model**: Uses a flow-matching objective with **Kabsch-aligned optimal transport** for stable and efficient molecular geometry generation.
 - **Large-scale training dataset**
   Trained on a dataset of **~1.7 million transition-state reactions** constructed through mechanistic enumeration and active learning.
 
@@ -48,7 +48,7 @@ Installation will usually take up to 20 minutes.
 ### System and Hardware Requirements
 
 - OS tested by authors:
-  - Ubuntu 24.04 LTS (latest stable Ubuntu LTS at time of writing)
+  - Ubuntu 24.04 LTS
 - Other platforms:
   - Expected to work, but if installation is not out-of-the-box, use the PyTorch Geometric installation guide for your exact Python/PyTorch/CUDA combination:
     https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
@@ -60,7 +60,7 @@ Installation will usually take up to 20 minutes.
 - Minimum practical GPU memory:
   - 8 GB VRAM can run inference, but requires reduced batch sizes
 - CPU-only:
-  - Possible, but not recommended and not systematically studied by the authors
+  - Supported; the checkpoint instructions include tested CPU inference commands
 
 OOM mitigation for larger molecules:
 
@@ -102,28 +102,42 @@ conda install -c conda-forge xtb
 
 ### Data Setup
 
-Release folder: [Google Drive](https://drive.google.com/drive/folders/1xGX0uZgaGHU_e-a8hDdflV4wWApczNVU?usp=sharing)
+Release folder: [RitS on Google Drive](https://drive.google.com/drive/folders/1xGX0uZgaGHU_e-a8hDdflV4wWApczNVU?usp=drive_link).
+The files are in its [data subfolder](https://drive.google.com/drive/folders/1J_b7U7KoP8nuAciDO76UpxVd3tX6VHYU).
 
-Available now:
+| Material | Download | Description |
+|---|---|---|
+| Training dataset | [rgd1_chembl_extended.h5](https://drive.google.com/file/d/13ldGDBEpPtMEI4bALhAeIQMTv7NAcVaS/view) | Approximately 1.7 million GFN2-xTB transition states |
+| Original RitS checkpoint | [rits.ckpt](https://drive.google.com/file/d/1tmCmIuzgDsZYg3DeMeA0fcKDqvbCyqye/view) | GFN2-xTB-trained model used for the broader reaction and selectivity examples |
+| Fine-tuned RitS checkpoint | [rits_finetuned.ckpt](https://drive.google.com/file/d/1fRNPWayFOqvee5Zvg89fEnwZNa7y90_c/view) | GFN2-xTB pretraining followed by TSDiff/Grambow benchmark fine-tuning |
+| RitS-TSDiff checkpoint | [rits_tsdiff.ckpt](https://drive.google.com/file/d/1eetV9VqIFAe-dCOaITePVLE5B0yiFE5m/view) | Trained from scratch on the TSDiff/Grambow benchmark |
+| Reaction examples | [reactions](https://drive.google.com/drive/folders/1PRPi25OtS-Lxt7ZvvXEhMG9IBtnVogeS) | Mapped inputs and a portable runner for the diverse reactions, Hajos cycle and selectivity channels |
+| Selectivity results | [selectivity](https://drive.google.com/drive/folders/1bhhqfn-kjqr_c-hmi1ijT8IUt6WT09Jb) | Compressed UMA geometries, IRC trajectories and thermochemistry |
+| Benchmark source data | [Transition1x](https://drive.google.com/drive/folders/11Dkvxps29PhwSpl-Jl7qHtvtPVAZS3r0) | TSDiff/Grambow source files; legacy folder name retained |
+| Processed benchmark data | [ts1x](https://drive.google.com/drive/folders/1Z8puHLdnsBbhz1dL2515u9dYf1BLL9Ft) | Preprocessed TSDiff/Grambow tensors; legacy folder name retained |
+| Checksums | [SHA256SUMS](https://drive.google.com/file/d/1HXfcpqScfVCKjF7b4OrZMTSNr_7PrFWy/view) | SHA-256 checksums for the release files |
 
-- TSDiff/Grambow training data (legacy `Transition1x` download paths)
-- RGD1-ChEMBL-extended GFN2-xTB training data (`data/rgd1_chembl_extended.h5`)
-- Earlier TSDiff/Grambow checkpoint (`data/ts1x_rits.ckpt`)
-- RitS checkpoint trained on RGD1-ChEMBL-extended (`data/rits.ckpt`)
+For inference, download the desired checkpoint into `data/`; the training datasets
+are not required. See [Running the released checkpoints](docs/released_checkpoints.md)
+for each model's matching configuration, preprocessing flags, runnable commands
+and SHA-256 checksum. The original and fine-tuned checkpoints use `rits.yaml`
+with `--kekulize --add_stereo`; `rits_tsdiff.ckpt` uses `ts1x_rits.yaml` without
+these flags. The older `ts1x_rits.ckpt` is not the selected `rits_tsdiff.ckpt`.
 
-The manuscript release uses `rits.ckpt`, `rits_finetuned.ckpt` and
-`rits_tsdiff.ckpt`. See [Running the released checkpoints](docs/released_checkpoints.md)
-for each model's training setting, matching configuration, runnable inference
-commands and SHA-256 checksum. The older `ts1x_rits.ckpt` is not the selected
-`rits_tsdiff.ckpt`; use the released file rather than renaming the older checkpoint.
+The TSDiff/Grambow benchmark and Transition1x are distinct datasets. Existing
+`Transition1x` and `ts1x` file/configuration names are retained for compatibility.
 
-Expected local layout after downloading and preprocessing both datasets:
+Expected local layout after downloading the selected files and preparing the datasets:
 
 ```text
 data/
 ├── rits.ckpt
-├── ts1x_rits.ckpt
+├── rits_finetuned.ckpt
+├── rits_tsdiff.ckpt
 ├── rgd1_chembl_extended.h5
+├── reactions/
+├── selectivity/
+│   └── uma_results.tar.gz
 ├── rits_dataset/
 │   └── processed/
 │       ├── train_h.pt
@@ -142,9 +156,9 @@ data/
         └── test_h.pt
 ```
 
-The downloaded files are the checkpoints, `rgd1_chembl_extended.h5`, and the
-Transition1x source files. The `rits_dataset/processed/` and `ts1x/processed/`
-directories are generated by the following preprocessing commands.
+The `rits_dataset/processed/` directory is generated by preprocessing the HDF5
+file. Download the processed benchmark tensors or regenerate `ts1x/processed/`
+from the TSDiff/Grambow source files using the commands below.
 
 #### RGD1-ChEMBL-extended
 
@@ -164,9 +178,9 @@ same edge encoding is constructed from stereochemistry specified in the input
 SMARTS. These defaults match the released `rits.ckpt`; they can be disabled for
 experiments with `--no-kekulize` or `--no-add-stereo`.
 
-#### Transition1x
+#### TSDiff/Grambow benchmark
 
-Preprocess Transition1x for training:
+Preprocess the benchmark source files for training (legacy paths shown below):
 
 ```bash
 python data_processing/prepare_ts1x_for_training.py \
@@ -194,7 +208,7 @@ python scripts/train.py \
     outdir="../test_runs" \
     data.dataset_root="./data/rits_dataset"
 
-# Train the Transition1x model instead
+# Train RitS-TSDiff on the TSDiff/Grambow benchmark instead
 python scripts/train.py \
     --config-path=conf \
     --config-name ts1x_rits \
@@ -230,33 +244,28 @@ python scripts/train.py \
 
 #### Transition States Generation
 
+Use atom-mapped SMILES for the released checkpoint commands so their preprocessing matches training.
+
 ```bash
-# Generate transition states from atom-mapped SMILES
+reactant='[C:1]([c:2]1[n:3][o:4][n:5][n:6]1)([H:7])([H:8])[H:9]'
+product='[C:1]1([H:7])([H:8])/[C:2](=[N:3]\[H:9])[N:6]1[N:5]=[O:4]'
+
+# Generate a transition-state guess from atom-mapped SMILES
 python scripts/sample_transition_state.py \
-    --reactant_smi "[C:1]([c:2]1[n:3][o:4][n:5][n:6]1)([H:7])([H:8])[H:9]" \
-    --product_smi "[C:1]1([H:7])([H:8])/[C:2](=[N:3]\\[H:9])[N:6]1[N:5]=[O:4]" \
+    --reactant_smi "$reactant" --product_smi "$product" \
     --config scripts/conf/rits.yaml \
     --ckpt data/rits.ckpt \
+    --kekulize --add_stereo \
     --output output.xyz \
     --n_samples 1 \
     --batch_size 32
 
-# Generate transition states from XYZ files
+# Generate multiple samples for the same mapped reaction
 python scripts/sample_transition_state.py \
-    --reactant_xyz reactant.xyz \
-    --product_xyz product.xyz \
+    --reactant_smi "$reactant" --product_smi "$product" \
     --config scripts/conf/rits.yaml \
     --ckpt data/rits.ckpt \
-    --output output.xyz \
-    --n_samples 5 \
-    --batch_size 32
-
-# Generate multiple samples per reaction
-python scripts/sample_transition_state.py \
-    --reactant_smi "[C:1][C:2]([H:3])([H:4])[H:5]" \
-    --product_smi "[C:1]=[C:2]([H:3])[H:4]" \
-    --config scripts/conf/rits.yaml \
-    --ckpt data/rits.ckpt \
+    --kekulize --add_stereo \
     --output ts_samples.xyz \
     --n_samples 10 \
     --batch_size 32
@@ -269,15 +278,15 @@ python scripts/sample_transition_state.py \
 
 **Notes:**
 
-- SMILES must have explicit hydrogens and can use atom mapping to specify atom correspondence
-- Reactant and product must have the same number of atoms
+- SMILES must have explicit hydrogens; atom maps should identify the same atoms on both sides
+- Reactant and product must contain the same atoms; XYZ inputs must use matching atom order
 - Output is saved as XYZ file(s) with transition state coordinates
 
 #### Available Configurations
 
 **Transition State Configs:**
 
-- `rits.yaml` - RitS stereochemistry-aware conformer generation model trained on our dataset
+- `rits.yaml` - RitS stereochemistry-aware transition-state model trained on our GFN2-xTB dataset; also used by the fine-tuned checkpoint
 - `ts1x_rits.yaml` - RitS-TSDiff configuration for TSDiff/Grambow training/evaluation
 
 ### Interactive App
@@ -313,7 +322,7 @@ python scripts/train.py \
     train.gpus=4 \
     train.n_epochs=500 \
     data.batch_size=64 \
-    data.dataset_root="./data/ts1x" \
+    data.dataset_root="./data/rits_dataset" \
     wandb_params.mode=online
 ```
 

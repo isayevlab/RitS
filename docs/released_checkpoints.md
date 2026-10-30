@@ -1,8 +1,12 @@
 # Running the released RitS checkpoints
 
 Install RitS using the environment instructions in the repository README, then
-place the three released checkpoint files in `data/`. Run the commands below from
-the repository root. The training HDF5 file is not needed for inference.
+download [rits.ckpt](https://drive.google.com/file/d/1tmCmIuzgDsZYg3DeMeA0fcKDqvbCyqye/view),
+[rits_finetuned.ckpt](https://drive.google.com/file/d/1fRNPWayFOqvee5Zvg89fEnwZNa7y90_c/view)
+and [rits_tsdiff.ckpt](https://drive.google.com/file/d/1eetV9VqIFAe-dCOaITePVLE5B0yiFE5m/view)
+from the [release data folder](https://drive.google.com/drive/folders/1J_b7U7KoP8nuAciDO76UpxVd3tX6VHYU)
+into `data/`. Run the commands below from the repository root. The training HDF5
+file is not needed for inference.
 
 | Checkpoint | Training and intended use | Inference configuration | Input preprocessing |
 |---|---|---|---|
